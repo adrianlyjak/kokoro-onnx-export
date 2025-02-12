@@ -4,6 +4,7 @@ from collections import defaultdict
 import numpy as np
 import onnx
 import typer
+from rich import print
 
 from .cli import app
 
@@ -64,3 +65,35 @@ def count_params(
         print(f"  {group:40s} {size_bytes / (1024):.2f} KB")
     total_size_kb = sum(size_bytes / (1024) for group, size_bytes in sorted_groups)
     print(f"Total parameter size: {total_size_kb:.2f} KB")
+
+
+@app.command()
+def count_node_types(
+    model_path: str = typer.Option("kokoro.onnx", help="Path to the ONNX model file"),
+):
+    """
+    Loads an ONNX model and summarizes its nodes by type.
+    """
+    model = onnx.load(model_path)
+
+    # Dictionary to count node types
+    node_type_counts = defaultdict(int)
+
+    # Count each node type
+    for node in model.graph.node:
+        node_type_counts[node.op_type] += 1
+
+    # Print summary
+    print("Node Types Summary:")
+
+    # Sort by count in descending order
+    sorted_types = sorted(node_type_counts.items(), key=lambda x: x[1], reverse=True)
+
+    total_nodes = sum(count for _, count in sorted_types)
+
+    # Print each type with count and percentage
+    for node_type, count in sorted_types:
+        percentage = (count / total_nodes) * 100
+        print(f"  {node_type:20s} {count:4d} ({percentage:5.1f}%)")
+
+    print(f"\nTotal number of nodes: {total_nodes}")

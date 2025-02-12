@@ -1,3 +1,3 @@
 import typer
 
-app = typer.Typer(help="Prompty build tools CLI")
+app = typer.Typer(help="Kokoro ONNX tools CLI", pretty_exceptions_show_locals=False)

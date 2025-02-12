@@ -6,8 +6,10 @@ import onnxruntime as ort
 import soundfile
 from huggingface_hub import hf_hub_download
 from onnxruntime import InferenceSession
+from rich import print
 
 from .cli import app
+from .util import execution_providers
 
 example_tokens = "[50, 157, 43, 135, 16, 53, 135, 46, 16, 43, 102, 16, 56, 156, 57, 135, 6, 16, 102, 62, 61, 16, 70, 56, 16, 138, 56, 156, 72, 56, 61, 85, 123, 83, 44, 83, 54, 16, 53, 65, 156, 86, 61, 62, 131, 83, 56, 4, 16, 54, 156, 43, 102, 53, 16, 156, 72, 61, 53, 102, 112, 16, 70, 56, 16, 138, 56, 44, 156, 76, 158, 123, 56, 16, 62, 131, 156, 43, 102, 54, 46, 16, 102, 48, 16, 81, 47, 102, 54, 16, 54, 156, 51, 158, 46, 16, 70, 16, 92, 156, 135, 46, 16, 54, 156, 43, 102, 48, 4, 16, 81, 47, 102, 16, 50, 156, 72, 64, 83, 56, 62, 16, 156, 51, 158, 64, 83, 56, 16, 44, 157, 102, 56, 16, 44, 156, 76, 158, 123, 56, 4]"
 
@@ -19,6 +21,7 @@ def prof_community(
     model_name: str = "unquant.onnx",
     output_file: str = "community_onnx.wav",
     speed: float = 1.0,
+    profile: bool = True,
 ) -> None:
     """
     Run profiled inferrence against competing onnx-community/Kokoro-82M-ONNX, to compare performance.
@@ -29,9 +32,9 @@ def prof_community(
         model_name: Name of the ONNX model file
         output_file: Path to save the output audio
         speed: Speed factor for audio generation
-        enable_profiling: Whether to enable ONNX profiling
+        profile: Whether to enable ONNX profiling
     """
-    enable_profiling: bool = True
+
     repo_id: str = "onnx-community/Kokoro-82M-ONNX"
     voices_dir: str = "./voices"
 
@@ -64,8 +67,12 @@ def prof_community(
 
     # Set up ONNX session
     session_options = ort.SessionOptions()
-    session_options.enable_profiling = enable_profiling
-    sess = InferenceSession(model_name, session_options)
+    session_options.enable_profiling = profile
+    sess = InferenceSession(
+        model_name,
+        session_options,
+        providers=execution_providers,
+    )
 
     # Run inference
     audio = sess.run(
@@ -77,7 +84,7 @@ def prof_community(
         ),
     )
 
-    if enable_profiling:
+    if profile:
         sess.end_profiling()
 
     # Save audio output
