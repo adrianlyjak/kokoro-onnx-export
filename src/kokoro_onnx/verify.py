@@ -10,7 +10,6 @@ import typer
 from huggingface_hub import hf_hub_download
 from kokoro.model import KModel, KModelForONNX
 from kokoro.pipeline import KPipeline
-from loguru import logger
 from torch.nn.functional import mse_loss
 
 from .cli import app
@@ -79,12 +78,16 @@ def verify(
         }
         session_options = ort.SessionOptions()
         session_options.enable_profiling = True
-        session = ort.InferenceSession(onnx_path, session_options)
+        session = ort.InferenceSession(
+            onnx_path,
+            session_options,
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
         ort_outputs = session.run(None, ort_inputs)
 
         # Export the profile data
         profile_file = session.end_profiling()
-        logger.info(f"ONNX model profiling data saved to: {profile_file}")
+        print(f"ONNX model profiling data saved to: {profile_file}")
 
         # Get audio outputs
         torch_audio = torch_output.cpu().numpy()
@@ -94,7 +97,7 @@ def verify(
         audio_mse = mse_loss(
             torch.tensor(torch_audio).flatten(), torch.tensor(onnx_audio).flatten()
         ).item()
-        logger.info(f"MSE for audio output: {audio_mse:.5f}")
+        print(f"MSE for audio output: {audio_mse:.5f}")
 
         # Save audio files
         output_dir = output_dir or "."
@@ -104,10 +107,8 @@ def verify(
         sf.write(torch_path, torch_audio, 24000)
         sf.write(onnx_path, onnx_audio, 24000)
 
-        logger.info(
+        print(
             f"Audio comparison complete. Files written: '{torch_path}', '{onnx_path}'."
         )
 
-        logger.info(
-            f"Mean squared error between PyTorch and ONNX outputs: {audio_mse:.5f}"
-        )
+        print(f"Mean squared error between PyTorch and ONNX outputs: {audio_mse:.5f}")

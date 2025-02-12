@@ -6,8 +6,10 @@ import onnx
 import onnxruntime as ort
 import torch
 import typer
+from huggingface_hub import hf_hub_download
 from kokoro.model import KModel, KModelForONNX
-from loguru import logger
+from kokoro.pipeline import KPipeline
+from rich import print
 
 from .cli import app
 
@@ -42,7 +44,7 @@ def export(
     # Validate the inputs against the model first
     start_time = time.time()
     output = model(input_ids=input_ids, ref_s=style, speed=dummy_speed)
-    logger.info(f"Time for dummy inputs: {time.time() - start_time}")
+    print(f"Time for dummy inputs: {time.time() - start_time}")
 
     # Define dynamic axes
     dynamic_axes = {
@@ -50,7 +52,7 @@ def export(
         "waveform": {0: "num_samples"},
     }
 
-    logger.info("Starting ONNX export...")
+    print("Starting ONNX export...")
     try:
         torch.onnx.export(
             model,
@@ -67,10 +69,13 @@ def export(
         # Verify the model
         onnx_model = onnx.load(output_path)
         onnx.checker.check_model(onnx_model)
-        logger.info("Model was successfully exported to ONNX")
+        print("Model was successfully exported to ONNX")
 
         # Additional check: Run a simple inference to validate the exported model
-        ort_session = ort.InferenceSession(str(output_path))
+        ort_session = ort.InferenceSession(
+            str(output_path),
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
         ort_inputs = {
             "input_ids": input_ids.numpy(),
             "style": style.numpy(),
@@ -82,8 +87,8 @@ def export(
         torch_audio = output
         onnx_audio = torch.tensor(ort_outputs[0])
         audio_mse = (torch_audio - onnx_audio).pow(2).mean().item()
-        logger.info(f"MSE for audio waveform: {audio_mse:.5f}")
+        print(f"MSE for audio waveform: {audio_mse:.5f}")
 
     except Exception as e:
-        logger.error(f"Export failed: {str(e)}")
+        print(f"Export failed: {str(e)}")
         raise

@@ -6,6 +6,7 @@ import onnxruntime as ort
 import soundfile
 from huggingface_hub import hf_hub_download
 from onnxruntime import InferenceSession
+from rich import print
 
 from .cli import app
 
@@ -65,7 +66,11 @@ def prof_community(
     # Set up ONNX session
     session_options = ort.SessionOptions()
     session_options.enable_profiling = enable_profiling
-    sess = InferenceSession(model_name, session_options)
+    sess = InferenceSession(
+        model_name,
+        session_options,
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
 
     # Run inference
     audio = sess.run(
