@@ -191,7 +191,6 @@ def initial_checking(model, disable_shape_infer):
     return model, func_infer_shape, is_fp16_ready_flag
 
 
-# new implementation by Xiaowu to fix a lot of bug due to ort changed
 def convert_float_to_float16(
     model,
     min_positive_val=1e-7,
@@ -202,67 +201,193 @@ def convert_float_to_float16(
     node_block_list=None,
     check_fp16_ready=True,
 ):
-    # create blocklists
+    """
+    A reworked entry-point to convert an ONNX ModelProto from float32 to float16.
+    This version does not insert up/down-casts around every blocked node input/output.
+    Instead, it only inserts boundary casts between float32-blocked nodes and float16 nodes.
+
+    :param model: ONNX ModelProto
+    :param min_positive_val: clamp for small positive floats
+    :param max_finite_val: clamp for large magnitude floats
+    :param keep_io_types: if True, top-level model inputs/outputs remain float32
+    :param disable_shape_infer: if True, skip the onnx.shape_inference pass
+    :param op_block_list: list of op_types that must remain float32
+    :param node_block_list: list of node names that must remain float32
+    :param check_fp16_ready: if True, throw an error if model is already fp16
+    :return: ModelProto in partial or full fp16
+    """
+    # Set up defaults
     if op_block_list is None:
         op_block_list = DEFAULT_OP_BLOCK_LIST
     if node_block_list is None:
-        node_block_list = []
+        node_block_list = set()
+    else:
+        node_block_list = set(node_block_list)
     op_block_list = set(op_block_list)
-    node_block_list = set(node_block_list)
 
-    global_input_name_dict = {}  # key: input name, value: new output name after Cast node
-    # basic checking, including shape inference
+    # Basic checking, optional shape inference
     model, func_infer_shape, is_fp16_ready_flag = initial_checking(
         model, disable_shape_infer
     )
     if is_fp16_ready_flag and check_fp16_ready:
         raise ValueError(
-            "The model is already converted to float16, if convert again, the model might be wrong. \n If you are sure to convert again, please set check_fp16_ready=False."
+            "The model appears to be (partially) in float16 already. "
+            "Set check_fp16_ready=False to override."
         )
 
-    graph_stack = [model.graph]
-
-    is_top_level = True
+    # Recursively convert all graphs (the main graph and any sub-graphs, e.g. in If/Loop/Scan)
+    graph_stack = [(model.graph, True)]  # (graph, is_top_level)
     while graph_stack:
-        next_level = []
-        for curr_graph in graph_stack:
-            process_graph_input(
-                curr_graph, is_top_level, keep_io_types, global_input_name_dict
-            )
-            value_info_block_list = process_tensor_in_node(
-                curr_graph,
-                op_block_list,
-                node_block_list,
-                min_positive_val,
-                max_finite_val,
-            )
-            process_value_info(curr_graph, value_info_block_list)
-            process_node_in_block_list(
-                curr_graph, global_input_name_dict, op_block_list, node_block_list
-            )
-            process_initializers(
-                curr_graph,
-                op_block_list,
-                node_block_list,
-                min_positive_val,
-                max_finite_val,
-            )
-            process_graph_output(curr_graph, is_top_level, keep_io_types)
-            sub_graph_list = get_next_level_graph(
-                curr_graph, op_block_list, node_block_list
-            )
-            if len(sub_graph_list) > 0:
-                next_level.extend(sub_graph_list)
+        curr_graph, is_top_level = graph_stack.pop()
+        convert_graph_to_float16(
+            curr_graph,
+            op_block_list,
+            node_block_list,
+            is_top_level,
+            keep_io_types,
+            min_positive_val,
+            max_finite_val,
+        )
+        # Gather sub-graphs to process
+        for node in curr_graph.node:
+            for attr in node.attribute:
+                if attr.g.node:  # single GraphProto
+                    graph_stack.append((attr.g, False))
+                for g in attr.graphs:  # list of GraphProto
+                    if g.node:
+                        graph_stack.append((g, False))
 
-            if not is_top_level:
-                process_node_input_output(curr_graph, global_input_name_dict)
-            is_top_level = False  # Going to process sub-graph
-        graph_stack = next_level
-
+    # Sort and remove unneeded casts
     sort_topology(model.graph)
     remove_unnecessary_cast_node(model.graph)
 
     return model
+
+
+def convert_graph_to_float16(
+    graph: onnx_proto.GraphProto,
+    op_block_list: set,
+    node_block_list: set,
+    is_top_level: bool,
+    keep_io_types: bool,
+    min_positive_val: float,
+    max_finite_val: float,
+):
+    """
+    Converts a single graph's nodes/initializers/values to float16, except for blocked ops/nodes.
+    Inserts boundary casts only where float16 nodes connect to float32 nodes.
+
+    :param graph: the GraphProto to modify in-place
+    :param op_block_list: set of op_types to keep in float32
+    :param node_block_list: set of node names to keep in float32
+    :param is_top_level: True if this is the model's top-level graph
+    :param keep_io_types: if True, do not alter input/output dtypes of the top-level graph
+    :param min_positive_val: clamp for small positive floats
+    :param max_finite_val: clamp for large magnitude floats
+    """
+
+    # 1) Mark each node as blocked or not
+    blocked_node_names = mark_blocked_nodes(graph, op_block_list, node_block_list)
+
+    # 2) Convert attributes for unblocked nodes to fp16
+    #    (We won't force a cast around blocked nodes; we simply keep them in fp32.)
+    process_tensor_in_node(graph, blocked_node_names, min_positive_val, max_finite_val)
+
+    # 3) Convert initializers to fp16 if they are exclusively used by unblocked nodes
+    process_initializers(graph, blocked_node_names, min_positive_val, max_finite_val)
+
+    # 4) Adjust graph inputs/outputs
+    #    - If top-level and keep_io_types=True, do NOT alter input/output dtypes.
+    #    - Otherwise, we switch them to fp16 unless they feed or come from a blocked node.
+    update_graph_io_dtypes(graph, blocked_node_names, is_top_level, keep_io_types)
+
+    # 5) Insert casts only on boundaries between float16 vs float32 nodes
+    insert_boundary_casts(graph, blocked_node_names)
+
+    # 6) Convert leftover non-blocked ValueInfo to float16
+    #    (Excluding the ones specifically used by blocked ops)
+    convert_value_infos(graph, blocked_node_names)
+
+
+def convert_value_infos(graph: onnx_proto.GraphProto, blocked_node_names: set):
+    """
+    Convert ValueInfo dtypes to float16 for unblocked edges.
+    """
+    # Build map: output_name -> node_name
+    output_to_node = {}
+    for node in graph.node:
+        for o_name in node.output:
+            output_to_node[o_name] = node.name
+
+    for value_info in graph.value_info:
+        producer_name = output_to_node.get(value_info.name, None)
+        # If there's no known producer, it might be a graph input, skip it here
+        if producer_name is None:
+            continue
+        # If producer is blocked => remain float32
+        if producer_name not in blocked_node_names:
+            # Convert to float16
+            if value_info.type.tensor_type.elem_type == onnx_proto.TensorProto.FLOAT:
+                value_info.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT16
+
+
+def update_graph_io_dtypes(
+    graph: onnx_proto.GraphProto,
+    blocked_node_names: set,
+    is_top_level: bool,
+    keep_io_types: bool,
+):
+    """
+    - If is_top_level and keep_io_types is False, forcibly set top-level inputs/outputs to FLOAT16.
+    - Otherwise (sub-graphs or keep_io_types=True), leave them as-is.
+    - We rely on boundary casts if a blocked node requires float32 internally.
+    """
+    if is_top_level and not keep_io_types:
+        # Force all top-level inputs to float16
+        for vi in graph.input:
+            if vi.type.tensor_type.elem_type == onnx_proto.TensorProto.FLOAT:
+                vi.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT16
+
+        # Force all top-level outputs to float16
+        for vi in graph.output:
+            if vi.type.tensor_type.elem_type == onnx_proto.TensorProto.FLOAT:
+                vi.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT16
+    # If keep_io_types=True, or this is a sub-graph, we do not modify the I/O dtypes here.
+    if is_top_level and keep_io_types:
+        return  # don't change top-level IO
+
+    # If a top-level input is used by blocked nodes, keep it float32; else convert to float16
+    input_to_nodes = {}
+    for node in graph.node:
+        for inp_name in node.input:
+            if inp_name not in input_to_nodes:
+                input_to_nodes[inp_name] = []
+            input_to_nodes[inp_name].append(node.name)
+
+    for vi in graph.input:
+        if vi.type.tensor_type.elem_type == onnx_proto.TensorProto.FLOAT:
+            # If any consumer is blocked => keep it float32
+            consumers = input_to_nodes.get(vi.name, [])
+            if any(c in blocked_node_names for c in consumers):
+                continue
+            # else convert to float16
+            vi.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT16
+
+    # For outputs, check the node that produces the output
+    output_to_producer = {}
+    for node in graph.node:
+        for o_name in node.output:
+            output_to_producer[o_name] = node.name
+
+    for vi in graph.output:
+        if vi.type.tensor_type.elem_type == onnx_proto.TensorProto.FLOAT:
+            producer_name = output_to_producer.get(vi.name, None)
+            if producer_name is None:
+                continue
+            if producer_name in blocked_node_names:
+                # produced by a blocked node => keep float32
+                continue
+            vi.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT16
 
 
 # Change the input/output of the node to the new output name after Cast node for sub-graph
@@ -360,109 +485,108 @@ def process_graph_output(
                 graph_output.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT16
 
 
-def process_node_in_block_list(
-    graph: onnx_proto.GraphProto,
-    global_input_name_dict: dict,
-    op_block_list: list,
-    node_block_list: list,
-):
+def mark_blocked_nodes(
+    graph: onnx_proto.GraphProto, op_block_list: set, node_block_list: set
+) -> set:
+    """
+    Return a set of node.names that must remain float32.
+    This includes:
+    - If the node's op_type is in op_block_list
+    - If the node's name is in node_block_list
+    """
+    blocked = set()
     for node in graph.node:
-        if (node.op_type in op_block_list) or (node.name in node_block_list):
-            insert_cast32_before_node(graph, node, global_input_name_dict)
-            insert_cast16_after_node(graph, node, global_input_name_dict)
+        if node.op_type in op_block_list:
+            blocked.add(node.name)
+        if node.name in node_block_list:
+            blocked.add(node.name)
+    return blocked
 
 
-# Todo: global_input_name_dict still not fill value
-def insert_cast32_before_node(
-    graph: onnx_proto.GraphProto, node: onnx_proto.NodeProto, global_input_name_dict
-):
-    for i in range(len(node.input)):
-        input_name = node.input[i]
-        for value_info in itertools.chain(graph.value_info, graph.input):
-            if input_name == value_info.name:
-                if (
-                    value_info.type.tensor_type.elem_type
-                    != onnx_proto.TensorProto.FLOAT16
-                ):
-                    break
-                cast_output_name = node.name + "_input_cast_" + str(i)
-                add_new_value_info(
-                    graph, value_info, cast_output_name, onnx_proto.TensorProto.FLOAT
+def insert_boundary_casts(graph: onnx_proto.GraphProto, blocked_node_names: set):
+    """
+    Insert cast ops only on edges where a float16 (unblocked) node output
+    feeds a float32 (blocked) node input, or vice versa.
+
+    We'll do a single pass:
+      For each node input, check the upstream node that produces it.
+      If upstream's blocked status differs from current node's blocked status,
+      we insert exactly one Cast on that edge.
+    """
+    # Collect info about which outputs come from which node
+    name_to_node_dict = {}
+    for node in graph.node:
+        for out_name in node.output:
+            name_to_node_dict[out_name] = node.name
+
+    # We'll create new cast nodes as needed
+    new_nodes = []
+    for node in graph.node:
+        cur_node_blocked = node.name in blocked_node_names
+        for i, inp_name in enumerate(node.input):
+            if inp_name not in name_to_node_dict:
+                # Possibly a graph input or initializer; handle that separately if needed
+                continue
+            upstream_node_name = name_to_node_dict[inp_name]
+            upstream_blocked = upstream_node_name in blocked_node_names
+            if upstream_blocked != cur_node_blocked:
+                # We have a boundary crossing: float32 -> float16 or float16 -> float32
+                # Insert a cast in between
+                cast_node_name = (
+                    f"Cast_boundary_{upstream_node_name}_to_{node.name}_{i}"
                 )
-                cast_node_name = node.name + "_input_cast" + str(i)
-                add_cast_node(
-                    graph,
-                    [input_name],
-                    [cast_output_name],
-                    cast_node_name,
-                    onnx_proto.TensorProto.FLOAT,
+                cast_output_name = inp_name + "_boundary_cast"
+                # Choose the 'to' type based on the current node's status
+                to_type = (
+                    onnx_proto.TensorProto.FLOAT16
+                    if not cur_node_blocked
+                    else onnx_proto.TensorProto.FLOAT
                 )
+                cast_node = helper.make_node(
+                    "Cast",
+                    inputs=[inp_name],
+                    outputs=[cast_output_name],
+                    name=cast_node_name,
+                    to=to_type,
+                )
+                new_nodes.append(cast_node)
+                # Redirect the node input to the cast's output
                 node.input[i] = cast_output_name
-                break
+
+    # Append new cast nodes at the end
+    graph.node.extend(new_nodes)
 
 
-# Todo: global_input_name_dict still not fill value
-def insert_cast16_after_node(
-    graph: onnx_proto.GraphProto, node: onnx_proto.NodeProto, global_input_name_dict
-):
-    for i in range(len(node.output)):
-        output_name = node.output[i]
-        for value_info in itertools.chain(graph.value_info, graph.output):
-            if output_name == value_info.name:
-                if (
-                    value_info.type.tensor_type.elem_type
-                    != onnx_proto.TensorProto.FLOAT
-                ):
-                    break
-                cast_input_name = node.name + "_output_cast_" + str(i)
-                add_new_value_info(
-                    graph, value_info, cast_input_name, onnx_proto.TensorProto.FLOAT
-                )
-                value_info.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT16
-                cast_node_name = node.name + "_output_cast" + str(i)
-                add_cast_node(
-                    graph,
-                    [cast_input_name],
-                    [output_name],
-                    cast_node_name,
-                    onnx_proto.TensorProto.FLOAT16,
-                )
-                node.output[i] = cast_input_name
-                break
-
-
-# Process tensor data in attribute of the node
 def process_tensor_in_node(
     graph: onnx_proto.GraphProto,
-    op_block_list: list,
-    node_block_list: list,
-    min_positive_val,
-    max_finite_val,
+    blocked_node_names: set,
+    min_positive_val: float,
+    max_finite_val: float,
 ):
-    value_info_block_list = set()  # This is for later use, not in this step
+    """
+    For each node not blocked, convert all float32 attributes/tensors to float16.
+    """
     for node in graph.node:
-        if (node.op_type in op_block_list) or (node.name in node_block_list):
-            # Only need to block the output value_info changing
-            for output_name in node.output:
-                value_info_block_list.add(output_name)
-        else:
-            for attr in node.attribute:
-                # one tensor
-                if attr.t.data_type == onnx_proto.TensorProto.FLOAT:
-                    attr.t.CopyFrom(
+        if node.name in blocked_node_names:
+            # Skip converting any attributes; remain float32
+            continue
+        # Convert float32 --> float16 in attributes
+        for attr in node.attribute:
+            # Single tensor
+            if attr.HasField("t") and attr.t.data_type == onnx_proto.TensorProto.FLOAT:
+                attr.t.CopyFrom(
+                    convert_tensor_float_to_float16(
+                        attr.t, min_positive_val, max_finite_val
+                    )
+                )
+            # List of tensors
+            for t in attr.tensors:
+                if t.data_type == onnx_proto.TensorProto.FLOAT:
+                    t.CopyFrom(
                         convert_tensor_float_to_float16(
-                            attr.t, min_positive_val, max_finite_val
+                            t, min_positive_val, max_finite_val
                         )
                     )
-                # list of tensor
-                for t in attr.tensors:
-                    if t.data_type == onnx_proto.TensorProto.FLOAT:
-                        t.CopyFrom(
-                            convert_tensor_float_to_float16(
-                                t, min_positive_val, max_finite_val
-                            )
-                        )
-    return value_info_block_list
 
 
 # Change all the value info type from float32 to float16 if not in block list
@@ -475,27 +599,34 @@ def process_value_info(graph: onnx_proto.GraphProto, value_info_block_list: list
                 value_info.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT16
 
 
-# Initializer is 'edge' type, so doesn't have value_info
 def process_initializers(
     graph: onnx_proto.GraphProto,
-    op_block_list,
-    node_block_list,
-    min_positive_val,
-    max_finite_val,
+    blocked_node_names: set,
+    min_positive_val: float,
+    max_finite_val: float,
 ):
-    # Find the input of the block node, don't need to change this kind of initializer
-    initializer_block_list = set()
+    """
+    Convert float32 initializers to float16 if all consumer nodes are unblocked.
+    """
+    # Figure out which nodes consume each initializer
+    init_name_to_consumers = {init.name: [] for init in graph.initializer}
     for node in graph.node:
-        if (node.op_type in op_block_list) or (node.name in node_block_list):
-            for input_name in node.input:  # some is initializer, some is value_info, can't distinguish but doesn't matter
-                initializer_block_list.add(input_name)
-    # Process initializers
-    for initializer in graph.initializer:
-        if initializer.name not in initializer_block_list:
-            if initializer.data_type == onnx_proto.TensorProto.FLOAT:
-                convert_tensor_float_to_float16(
-                    initializer, min_positive_val, max_finite_val
-                )
+        for input_name in node.input:
+            if input_name in init_name_to_consumers:
+                init_name_to_consumers[input_name].append(node.name)
+
+    # Decide which inits can be converted
+    for init in graph.initializer:
+        consumer_list = init_name_to_consumers[init.name]
+        if not consumer_list:
+            # Not consumed by any node => safe to convert
+            can_convert = True
+        else:
+            # If any consumer is blocked => keep it float32
+            can_convert = all(c not in blocked_node_names for c in consumer_list)
+
+        if can_convert and init.data_type == onnx_proto.TensorProto.FLOAT:
+            convert_tensor_float_to_float16(init, min_positive_val, max_finite_val)
 
 
 def get_next_level_graph(

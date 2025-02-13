@@ -20,7 +20,6 @@ from onnxruntime.quantization import (
 )
 from onnxruntime.quantization.calibrate import CalibrationDataReader
 from onnxruntime.quantization.shape_inference import quant_pre_process
-from onnxruntime.transformers.float16 import convert_float_to_float16
 from rich import print
 from rich.progress import (
     BarColumn,
@@ -33,6 +32,7 @@ from rich.progress import (
 from kokoro_onnx.util import load_vocab
 
 from .cli import app
+from .convert_float_to_float16 import convert_float_to_float16
 from .util import mse_output_score
 
 
