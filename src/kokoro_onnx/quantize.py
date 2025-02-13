@@ -12,7 +12,6 @@ import typer
 from huggingface_hub import hf_hub_download
 from kokoro.pipeline import KPipeline
 from onnxconverter_common.auto_mixed_precision import auto_convert_mixed_precision
-from onnxconverter_common.float16 import convert_float_to_float16
 from onnxruntime.quantization import (
     CalibrationMethod,
     QuantFormat,
@@ -21,6 +20,7 @@ from onnxruntime.quantization import (
 )
 from onnxruntime.quantization.calibrate import CalibrationDataReader
 from onnxruntime.quantization.shape_inference import quant_pre_process
+from onnxruntime.transformers.float16 import convert_float_to_float16
 from rich import print
 from rich.progress import (
     BarColumn,

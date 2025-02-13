@@ -2,3 +2,4 @@ __pycache__
 *.onnx
 *.wav
 onnxruntime_profile__*.json
+nc_workspace
