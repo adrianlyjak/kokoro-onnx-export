@@ -1,7 +1,9 @@
+import json
 from typing import Union
 
 import numpy as np
 import torch
+from huggingface_hub import hf_hub_download
 
 execution_providers = [
     "CUDAExecutionProvider",
@@ -11,8 +13,8 @@ execution_providers = [
 
 
 def mse_output_score(
-    torch_audio: Union[torch.Tensor, np.ndarray],
-    onnx_audio: Union[torch.Tensor, np.ndarray],
+    a: Union[torch.Tensor, np.ndarray],
+    b: Union[torch.Tensor, np.ndarray],
 ) -> float:
     """Compare two audio outputs, handling different lengths.
 
@@ -25,25 +27,36 @@ def mse_output_score(
         which naturally increases the score.
     """
     # Convert to numpy if needed
-    if isinstance(torch_audio, torch.Tensor):
-        torch_audio = torch_audio.detach().cpu().numpy()
-    if isinstance(onnx_audio, torch.Tensor):
-        onnx_audio = onnx_audio.detach().cpu().numpy()
+    if isinstance(a, torch.Tensor):
+        a = a.detach().cpu().numpy()
+    if isinstance(b, torch.Tensor):
+        b = b.detach().cpu().numpy()
 
     # Ensure arrays are 2D (batch_size, sequence_length)
-    if torch_audio.ndim == 1:
-        torch_audio = torch_audio[np.newaxis, :]
-    if onnx_audio.ndim == 1:
-        onnx_audio = onnx_audio[np.newaxis, :]
+    if a.ndim == 1:
+        a = a[np.newaxis, :]
+    if b.ndim == 1:
+        b = b[np.newaxis, :]
 
-    length_diff = abs(torch_audio.shape[-1] - onnx_audio.shape[-1])
+    length_diff = abs(a.shape[-1] - b.shape[-1])
 
     # Pad shorter array to match longer one
-    if torch_audio.shape[-1] > onnx_audio.shape[-1]:
+    if a.shape[-1] > b.shape[-1]:
         pad_width = ((0, 0), (0, length_diff))
-        onnx_audio = np.pad(onnx_audio, pad_width, mode="constant")
-    elif onnx_audio.shape[-1] > torch_audio.shape[-1]:
+        b = np.pad(b, pad_width, mode="constant")
+    elif b.shape[-1] > a.shape[-1]:
         pad_width = ((0, 0), (0, length_diff))
-        torch_audio = np.pad(torch_audio, pad_width, mode="constant")
+        a = np.pad(a, pad_width, mode="constant")
 
-    return np.mean(np.square(torch_audio - onnx_audio))
+    return np.mean(np.square(a - b))
+
+
+def load_vocab(
+    repo_id: str = "hexgrad/Kokoro-82M", config_filename: str = "config.json"
+) -> dict[str, int]:
+    # Load vocabulary from Hugging Face
+    config_path = hf_hub_download(repo_id=repo_id, filename=config_filename)
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    vocab = config["vocab"]
+    return vocab
