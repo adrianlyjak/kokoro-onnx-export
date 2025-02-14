@@ -485,6 +485,8 @@ def test_if_subgraph_blocking(tmp_path):
     # 5) Confirm the model is valid
     onnx.checker.check_model(fp16_model)
 
+    print(generate_mermaid_from_onnx(fp16_model))
+
     # 6) Test in ONNXRuntime
     sess = ort.InferenceSession(fp16_model.SerializeToString())
 
@@ -514,3 +516,62 @@ def test_if_subgraph_blocking(tmp_path):
 
     # If your sub-graph boundary logic is incomplete, you'll typically see
     # a TypeError or mismatch at the .run(...) call
+
+
+def generate_mermaid_from_onnx(model: onnx.ModelProto) -> str:
+    """Convert ONNX model to Mermaid diagram string."""
+    graph = model.graph
+
+    mermaid_lines = ["graph TD"]
+    node_names: Set[str] = set()
+
+    def sanitize_name(name: str) -> str:
+        """Make node names Mermaid-compatible."""
+        return name.replace(" ", "_").replace("/", "_").replace(":", "_")
+
+    def process_graph(graph, prefix=""):
+        """Process graph and subgraphs recursively."""
+        # Add nodes
+        for node in graph.node:
+            node_id = (
+                sanitize_name(node.name) if node.name else f"node_{len(node_names)}"
+            )
+            while node_id in node_names:
+                node_id = f"{node_id}_{len(node_names)}"
+            node_names.add(node_id)
+
+            # Create node label with op_type
+            label = f"{node_id}[{node.op_type}]"
+            mermaid_lines.append(f"    {label}")
+
+            # Add edges from inputs
+            for input_name in node.input:
+                if input_name:  # Skip empty inputs
+                    input_id = sanitize_name(input_name)
+                    mermaid_lines.append(f"    {input_id} --> {node_id}")
+
+            # If node is an If node, process subgraphs
+            if node.op_type == "If":
+                for attr in node.attribute:
+                    if attr.name in ["then_branch", "else_branch"]:
+                        subgraph = attr.g
+                        subgraph_prefix = f"{node_id}_{attr.name}"
+
+                        # Create subgraph
+                        mermaid_lines.append(f"    subgraph {subgraph_prefix}")
+                        process_graph(subgraph, subgraph_prefix)
+                        mermaid_lines.append("    end")
+
+                        # Connect subgraph to parent node
+                        mermaid_lines.append(f"    {node_id} --> {subgraph_prefix}")
+
+    # Process initializers as input nodes
+    for initializer in graph.initializer:
+        init_id = sanitize_name(initializer.name)
+        mermaid_lines.append(f"    {init_id}((Input))")
+        node_names.add(init_id)
+
+    # Process main graph
+    process_graph(graph)
+
+    return "\n".join(mermaid_lines)
