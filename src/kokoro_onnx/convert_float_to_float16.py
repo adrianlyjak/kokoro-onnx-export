@@ -248,15 +248,17 @@ def convert_float_to_float16(
             min_positive_val,
             max_finite_val,
         )
-        # Gather sub-graphs to process
+        # Gather subgraphs and push them on the stack
         for node in curr_graph.node:
+            if node.op_type in op_block_list or node.name in node_block_list:
+                # block => do NOT convert its subgraphs
+                continue
             for attr in node.attribute:
-                if attr.g.node:  # single GraphProto
+                if attr.g.node:  # single sub-graph
                     graph_stack.append((attr.g, False))
-                for g in attr.graphs:  # list of GraphProto
+                for g in attr.graphs:
                     if g.node:
                         graph_stack.append((g, False))
-
     # Sort and remove unneeded casts
     sort_topology(model.graph)
     remove_unnecessary_cast_node(model.graph)
@@ -275,60 +277,106 @@ def convert_graph_to_float16(
 ):
     """
     Converts a single graph's nodes/initializers/values to float16, except for blocked ops/nodes.
-    Inserts boundary casts only where float16 nodes connect to float32 nodes.
-
-    :param graph: the GraphProto to modify in-place
-    :param op_block_list: set of op_types to keep in float32
-    :param node_block_list: set of node names to keep in float32
-    :param is_top_level: True if this is the model's top-level graph
-    :param keep_io_types: if True, do not alter input/output dtypes of the top-level graph
-    :param min_positive_val: clamp for small positive floats
-    :param max_finite_val: clamp for large magnitude floats
+    Inserts boundary casts only where float16 nodes connect to float32 nodes, including sub-graph boundaries.
     """
 
-    # 1) Mark each node as blocked or not
+    # 1) Mark each node blocked or not
     blocked_node_names = mark_blocked_nodes(graph, op_block_list, node_block_list)
 
-    # 2) Convert attributes for unblocked nodes to fp16
-    #    (We won't force a cast around blocked nodes; we simply keep them in fp32.)
+    # 2) Convert node attributes (tensors -> float16) for unblocked nodes
     process_tensor_in_node(graph, blocked_node_names, min_positive_val, max_finite_val)
 
-    # 3) Convert initializers to fp16 if they are exclusively used by unblocked nodes
+    # 3) Convert initializers to float16 if exclusively used by unblocked nodes
     process_initializers(graph, blocked_node_names, min_positive_val, max_finite_val)
 
     # 4) Adjust graph inputs/outputs
-    #    - If top-level and keep_io_types=True, do NOT alter input/output dtypes.
-    #    - Otherwise, we switch them to fp16 unless they feed or come from a blocked node.
     update_graph_io_dtypes(graph, blocked_node_names, is_top_level, keep_io_types)
 
-    # 5) Insert casts only on boundaries between float16 vs float32 nodes
+    # 5) Insert boundary casts for node↔node edges
     insert_boundary_casts(graph, blocked_node_names)
 
     # 6) Convert leftover non-blocked ValueInfo to float16
-    #    (Excluding the ones specifically used by blocked ops)
     convert_value_infos(graph, blocked_node_names)
+
+    # 7) Now handle sub-graphs for control-flow ops
+    for node in graph.node:
+        # If node is blocked => skip sub-graph conversion
+        if node.name in blocked_node_names or node.op_type in op_block_list:
+            continue
+
+        # Otherwise, node is unblocked => any sub-graph belongs to the float16 domain
+        # Insert boundary casts between node <-> sub-graph
+        for attr in node.attribute:
+            if attr.g.node:  # single sub-graph
+                insert_if_subgraph_boundary_casts(node, attr.g, blocked_node_names)
+                # Recurse
+                convert_graph_to_float16(
+                    attr.g,
+                    op_block_list,
+                    node_block_list,
+                    is_top_level=False,  # sub-graph is not top-level
+                    keep_io_types=False,  # sub-graph doesn't keep model IO types
+                    min_positive_val=min_positive_val,
+                    max_finite_val=max_finite_val,
+                )
+            for g in attr.graphs:
+                if g.node:
+                    insert_if_subgraph_boundary_casts(node, g, blocked_node_names)
+                    convert_graph_to_float16(
+                        g,
+                        op_block_list,
+                        node_block_list,
+                        is_top_level=False,
+                        keep_io_types=False,
+                        min_positive_val=min_positive_val,
+                        max_finite_val=max_finite_val,
+                    )
+
+    # 8) Clean up casts + sort
+    sort_topology(graph)
+    remove_unnecessary_cast_node(graph)
 
 
 def convert_value_infos(graph: onnx_proto.GraphProto, blocked_node_names: set):
     """
     Convert ValueInfo dtypes to float16 for unblocked edges.
     """
+    print("\nConverting ValueInfos:")
+
     # Build map: output_name -> node_name
     output_to_node = {}
     for node in graph.node:
         for o_name in node.output:
             output_to_node[o_name] = node.name
 
-    for value_info in graph.value_info:
+    # Helper function to convert a value info if its producer is not blocked
+    def convert_if_unblocked(value_info):
         producer_name = output_to_node.get(value_info.name, None)
+        print(f"ValueInfo: {value_info.name}")
+        print(f"  Producer: {producer_name}")
+        print(f"  Current type: {value_info.type.tensor_type.elem_type}")
+
         # If there's no known producer, it might be a graph input, skip it here
         if producer_name is None:
-            continue
+            print("  No producer found - skipping")
+            return
+
         # If producer is blocked => remain float32
         if producer_name not in blocked_node_names:
             # Convert to float16
             if value_info.type.tensor_type.elem_type == onnx_proto.TensorProto.FLOAT:
+                print("  Converting to float16")
                 value_info.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT16
+        else:
+            print("  Producer is blocked - keeping float32")
+
+    # Convert both value_info and output types
+    for value_info in graph.value_info:
+        convert_if_unblocked(value_info)
+
+    # Also convert output types if their producer is not blocked
+    for output in graph.output:
+        convert_if_unblocked(output)
 
 
 def update_graph_io_dtypes(
@@ -352,9 +400,6 @@ def update_graph_io_dtypes(
         for vi in graph.output:
             if vi.type.tensor_type.elem_type == onnx_proto.TensorProto.FLOAT:
                 vi.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT16
-    # If keep_io_types=True, or this is a sub-graph, we do not modify the I/O dtypes here.
-    if is_top_level and keep_io_types:
-        return  # don't change top-level IO
 
     # If a top-level input is used by blocked nodes, keep it float32; else convert to float16
     input_to_nodes = {}
@@ -485,21 +530,149 @@ def process_graph_output(
                 graph_output.type.tensor_type.elem_type = onnx_proto.TensorProto.FLOAT16
 
 
+def insert_if_subgraph_boundary_casts(
+    parent_node: onnx_proto.NodeProto,
+    sub_graph: onnx_proto.GraphProto,
+    blocked_node_names: set,
+):
+    """
+    Inserts cast ops in the *parent graph* so that the sub-graph's inputs/outputs
+    have the correct float16 vs. float32 type, matching the parent's domain.
+
+    Because we've already decided `parent_node` is "unblocked," we want float16 in the sub-graph.
+    If the sub-graph had partial blocking, it will handle internal boundary casts.
+
+    If you wanted to handle the scenario: "parent blocked => sub-graph float32," you'd do that here.
+    For simplicity, we skip that because we already skip recursion for blocked nodes.
+
+    Note: This logic is easiest if the sub-graph is all float16, but in practice you can do partial blocking
+    in the sub-graph. The point is to handle the edge from the parent's output to the sub-graph's input,
+    or from sub-graph's output to the parent's output.
+    """
+    parent_is_blocked = parent_node.name in blocked_node_names
+    desired_elem = (
+        onnx_proto.TensorProto.FLOAT
+        if parent_is_blocked
+        else onnx_proto.TensorProto.FLOAT16
+    )
+
+    # We'll do a simple approach:
+    # 1) For each sub_graph input that is float32 or float16, ensure it matches `desired_elem`.
+    # 2) If mismatch => rename sub_graph input, create a Cast in the parent graph from oldName->newName.
+
+    # Build set of used names in the parent graph to avoid collisions
+    used_names = set()
+    for n in parent_node.graph.node:
+        used_names.update(n.input)
+        used_names.update(n.output)
+    for vi in parent_node.graph.value_info:
+        used_names.add(vi.name)
+    for vi in parent_node.graph.input:
+        used_names.add(vi.name)
+    for vi in parent_node.graph.output:
+        used_names.add(vi.name)
+    for init in parent_node.graph.initializer:
+        used_names.add(init.name)
+
+    # sub_graph inputs
+    for sg_input in sub_graph.input:
+        dt = sg_input.type.tensor_type.elem_type
+        if dt not in (onnx_proto.TensorProto.FLOAT, onnx_proto.TensorProto.FLOAT16):
+            continue  # ignoring bool, int64, etc.
+
+        if dt == desired_elem:
+            # no cast needed
+            continue
+
+        old_name = sg_input.name
+        # Create new name
+        base_new_name = old_name + "_subgraph_casted"
+        new_name = base_new_name
+        idx = 0
+        while new_name in used_names:
+            idx += 1
+            new_name = base_new_name + f"_{idx}"
+        used_names.add(new_name)
+
+        # (A) rename sub_graph.input => so sub_graph now reads from new_name
+        sg_input.name = new_name
+
+        # (B) insert a Cast node in the parent graph from old_name -> new_name
+        cast_node_name = old_name + "_parent_cast_subgraph_in"
+        cast_node = helper.make_node(
+            "Cast",
+            inputs=[old_name],
+            outputs=[new_name],
+            name=cast_node_name,
+            to=desired_elem,
+        )
+        parent_node.graph.node.append(cast_node)
+
+        # (C) Optionally add a ValueInfo for the new_name in parent graph
+        # so we have shape info. You can add one if you like:
+        new_vi = parent_node.graph.value_info.add()
+        new_vi.name = new_name
+        new_vi.type.tensor_type.elem_type = desired_elem
+        # If you want shape, you can copy from old_name if known, but it's optional.
+
+    # sub_graph outputs
+    # The sub_graph outputs feed the parent node’s outputs for that branch.
+    # If we want float16 in the parent, but the sub_graph has float32, we must cast it (in the sub_graph)
+    # or cast it (in the parent) after the sub_graph finishes.  Usually we do it in the sub_graph
+    # for cleanliness, but ONNX “If” does not let us just insert new nodes in the sub_graph
+    # without changing the sub_graph input->output relationship. So we do a parent “Cast” after the If node?
+
+    # However, in standard ONNX "If", the sub-graph's outputs must match the If node's output type exactly,
+    # or ONNX will throw a type error. So if the If node is float16, the sub-graph must produce float16.
+    # If there's a mismatch, the runtime fails.
+    #
+    # Easiest approach: forcibly set sub_graph.output elem_type to desired_elem
+    # so it matches the If node's float16. Then, if we do partial blocking inside sub_graph
+    # we rely on sub_graph's own boundary casts.
+    for sg_output in sub_graph.output:
+        dt = sg_output.type.tensor_type.elem_type
+        if dt not in (onnx_proto.TensorProto.FLOAT, onnx_proto.TensorProto.FLOAT16):
+            continue
+
+        if dt == desired_elem:
+            continue
+
+        # forcibly set sub_graph output to float16
+        sg_output.type.tensor_type.elem_type = desired_elem
+
+    # Done. The sub_graph boundary is now consistent with the parent's domain.
+
+
 def mark_blocked_nodes(
     graph: onnx_proto.GraphProto, op_block_list: set, node_block_list: set
 ) -> set:
     """
     Return a set of node.names that must remain float32.
-    This includes:
-    - If the node's op_type is in op_block_list
-    - If the node's name is in node_block_list
+    A node is blocked if:
+    - Its op_type is in op_block_list (ops to keep in float32)
+    - OR its name is in node_block_list
     """
     blocked = set()
+    print("\nDeciding which nodes to block:")
     for node in graph.node:
-        if node.op_type in op_block_list:
-            blocked.add(node.name)
+        should_block = False
+
+        # First check if it's explicitly blocked by name
         if node.name in node_block_list:
+            should_block = True
+            print(f"Node {node.name} (op={node.op_type}): blocked by name")
+        # Then check if its op_type is in the block list
+        elif node.op_type in op_block_list:
+            should_block = True
+            print(
+                f"Node {node.name} (op={node.op_type}): blocked - op in block list {op_block_list}"
+            )
+        else:
+            print(f"Node {node.name} (op={node.op_type}): NOT blocked")
+
+        if should_block:
             blocked.add(node.name)
+
     return blocked
 
 
@@ -508,10 +681,8 @@ def insert_boundary_casts(graph: onnx_proto.GraphProto, blocked_node_names: set)
     Insert cast ops only on edges where a float16 (unblocked) node output
     feeds a float32 (blocked) node input, or vice versa.
 
-    We'll do a single pass:
-      For each node input, check the upstream node that produces it.
-      If upstream's blocked status differs from current node's blocked status,
-      we insert exactly one Cast on that edge.
+    We generate a unique cast output name each time, to avoid collisions
+    in large or repeated networks.
     """
     # Collect info about which outputs come from which node
     name_to_node_dict = {}
@@ -519,29 +690,61 @@ def insert_boundary_casts(graph: onnx_proto.GraphProto, blocked_node_names: set)
         for out_name in node.output:
             name_to_node_dict[out_name] = node.name
 
-    # We'll create new cast nodes as needed
+    # Keep track of existing tensor names to avoid collisions
+    used_tensor_names = set()
+    for node in graph.node:
+        used_tensor_names.update(node.input)
+        used_tensor_names.update(node.output)
+    # Also consider graph inputs/outputs
+    for vi in graph.input:
+        used_tensor_names.add(vi.name)
+    for vi in graph.output:
+        used_tensor_names.add(vi.name)
+    for vi in graph.value_info:
+        used_tensor_names.add(vi.name)
+    for init in graph.initializer:
+        used_tensor_names.add(init.name)
+
     new_nodes = []
+    # We'll increment a counter each time we need to disambiguate
+    boundary_cast_counter = 0
+
     for node in graph.node:
         cur_node_blocked = node.name in blocked_node_names
         for i, inp_name in enumerate(node.input):
             if inp_name not in name_to_node_dict:
-                # Possibly a graph input or initializer; handle that separately if needed
+                # Possibly a graph input or initializer
                 continue
+
             upstream_node_name = name_to_node_dict[inp_name]
             upstream_blocked = upstream_node_name in blocked_node_names
             if upstream_blocked != cur_node_blocked:
                 # We have a boundary crossing: float32 -> float16 or float16 -> float32
-                # Insert a cast in between
+
+                # We'll build a unique cast node name
                 cast_node_name = (
                     f"Cast_boundary_{upstream_node_name}_to_{node.name}_{i}"
                 )
-                cast_output_name = inp_name + "_boundary_cast"
+                # Build a unique output name to avoid collisions
+                cast_output_name_base = inp_name + "_boundary_cast"
+                cast_output_name = cast_output_name_base
+                while cast_output_name in used_tensor_names:
+                    cast_output_name = (
+                        f"{cast_output_name_base}_{boundary_cast_counter}"
+                    )
+                    boundary_cast_counter += 1
+
+                # Mark it used
+                used_tensor_names.add(cast_output_name)
+
                 # Choose the 'to' type based on the current node's status
                 to_type = (
                     onnx_proto.TensorProto.FLOAT16
                     if not cur_node_blocked
                     else onnx_proto.TensorProto.FLOAT
                 )
+
+                # Create the new cast node
                 cast_node = helper.make_node(
                     "Cast",
                     inputs=[inp_name],
@@ -550,11 +753,130 @@ def insert_boundary_casts(graph: onnx_proto.GraphProto, blocked_node_names: set)
                     to=to_type,
                 )
                 new_nodes.append(cast_node)
+
                 # Redirect the node input to the cast's output
                 node.input[i] = cast_output_name
 
     # Append new cast nodes at the end
     graph.node.extend(new_nodes)
+
+
+def insert_io_casts_for_keep_io_types(
+    graph: onnx_proto.GraphProto,
+    blocked_node_names: set,
+):
+    """
+    If keep_io_types=True, the top-level graph inputs/outputs remain float32.
+    But unblocked (float16) nodes that consume/produce those tensors need boundary casts.
+    """
+
+    # 1) Handle top-level inputs that remain float32 but feed unblocked float16 nodes
+    #    - If an input goes to at least one unblocked consumer, insert one float32->float16 Cast
+    #    - Blocked consumers stay on float32
+
+    # Mapping input_name -> list of nodes that consume it
+    input_to_nodes = {}
+    for node in graph.node:
+        for inp_name in node.input:
+            input_to_nodes.setdefault(inp_name, []).append(node)
+
+    # Keep track of used tensor names to avoid collisions
+    used_names = set()
+    for node in graph.node:
+        used_names.update(node.input)
+        used_names.update(node.output)
+    for vi in graph.input:
+        used_names.add(vi.name)
+    for vi in graph.output:
+        used_names.add(vi.name)
+    for vi in graph.value_info:
+        used_names.add(vi.name)
+    for init in graph.initializer:
+        used_names.add(init.name)
+
+    new_nodes = []
+    for g_input in graph.input:
+        if g_input.type.tensor_type.elem_type != onnx_proto.TensorProto.FLOAT:
+            continue  # Only worry about float32 inputs
+        consumers = input_to_nodes.get(g_input.name, [])
+        # Partition consumers: some may be blocked (want float32), some unblocked (now float16)
+        unblocked_consumers = [c for c in consumers if c.name not in blocked_node_names]
+        # If no unblocked consumers, no cast needed
+        if not unblocked_consumers:
+            continue
+
+        # Create a single cast node from input float32 → float16
+        cast_name = f"Cast_input_{g_input.name}_to_fp16"
+        cast_output_name = f"{g_input.name}_fp16"
+        # Ensure uniqueness
+        base_out = cast_output_name
+        counter = 0
+        while cast_output_name in used_names:
+            cast_output_name = f"{base_out}_{counter}"
+            counter += 1
+        used_names.add(cast_output_name)
+
+        cast_node = helper.make_node(
+            "Cast",
+            inputs=[g_input.name],
+            outputs=[cast_output_name],
+            name=cast_name,
+            to=onnx_proto.TensorProto.FLOAT16,
+        )
+        new_nodes.append(cast_node)
+
+        # Redirect all unblocked consumers to use the cast node output
+        for node_ in unblocked_consumers:
+            for i, inp_name in enumerate(node_.input):
+                if inp_name == g_input.name:
+                    node_.input[i] = cast_output_name
+
+    # 2) Handle top-level outputs that remain float32 but might be produced by unblocked float16 nodes
+    #    - If an output is float32, but is produced by an unblocked node, insert float16->float32 Cast.
+
+    # Build map: output_tensor_name -> producing node
+    output_to_node = {}
+    for node in graph.node:
+        for o_name in node.output:
+            output_to_node[o_name] = node.name
+
+    for g_output in graph.output:
+        if g_output.type.tensor_type.elem_type != onnx_proto.TensorProto.FLOAT:
+            continue  # Only worry about float32 outputs
+        producer = output_to_node.get(g_output.name, None)
+        if producer is None:
+            continue  # Not produced by any node, might be an unused graph input or something
+        if producer in blocked_node_names:
+            continue  # Produced by a blocked (float32) node => no cast needed
+
+        # So the node is unblocked => node outputs float16, but we want top-level float32.
+        # Insert a cast node float16 -> float32
+        cast_name = f"Cast_output_{g_output.name}_to_fp32"
+        cast_input_name = g_output.name
+        cast_output_name = f"{g_output.name}_fp32"
+
+        base_out = cast_output_name
+        counter = 0
+        while cast_output_name in used_names:
+            cast_output_name = f"{base_out}_{counter}"
+            counter += 1
+        used_names.add(cast_output_name)
+
+        cast_node = helper.make_node(
+            "Cast",
+            inputs=[cast_input_name],
+            outputs=[cast_output_name],
+            name=cast_name,
+            to=onnx_proto.TensorProto.FLOAT,
+        )
+        new_nodes.append(cast_node)
+
+        # Now rename the top-level output to the cast's output
+        g_output.name = cast_output_name
+
+    # Finally, insert these new cast nodes at the end of graph.node
+    if new_nodes:
+        graph.node.extend(new_nodes)
 
 
 def process_tensor_in_node(

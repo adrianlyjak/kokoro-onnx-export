@@ -3,3 +3,4 @@ __pycache__
 *.wav
 onnxruntime_profile__*.json
 nc_workspace
+.DS_Store
