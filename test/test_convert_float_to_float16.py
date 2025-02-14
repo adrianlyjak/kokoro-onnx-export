@@ -91,48 +91,39 @@ def test_partial_block():
 
     # Check for a boundary cast node from "BlockedRelu" -> "UnblockedSigmoid"
     cast_nodes = [n for n in new_model.graph.node if n.op_type == "Cast"]
-    assert len(cast_nodes) > 0, "Expected at least one boundary Cast insertion."
+    assert len(cast_nodes) == 1, "Expected one boundary Cast insertion."
 
-    # Check inputs/outputs are float16 now, given keep_io_types=False
-    for i in new_model.graph.input:
-        assert i.type.tensor_type.elem_type == TensorProto.FLOAT16
+    # Check outputs are float16 now, given keep_io_types=False
+    for i in new_model.graph.input:  # still float 32, since the first node is blocked
+        assert i.type.tensor_type.elem_type == TensorProto.FLOAT
     for o in new_model.graph.output:
         assert o.type.tensor_type.elem_type == TensorProto.FLOAT16
 
 
-def test_subgraph_with_if_mismatch():
-    """
-    Reproduce an If node scenario with a subgraph that must remain float32
-    because its parent node is blocked.
-
-    We'll set keep_io_types=True to ensure the top-level inputs/outputs
-    also stay float32.
-    """
+def create_if_graph_model():
     # Step 1: Build a subgraph for 'then_branch':
     #   Subgraph input -> Squeeze -> Subgraph output
-    then_in = helper.make_tensor_value_info("then_in", TensorProto.FLOAT, [None])
     then_out = helper.make_tensor_value_info("then_out", TensorProto.FLOAT, [None])
     squeeze_node = helper.make_node(
         "Squeeze",
-        inputs=["then_in"],
+        inputs=["ConvOut"],
         outputs=["then_out"],
         name="Squeeze_in_then_branch",
     )
     then_graph = helper.make_graph(
-        nodes=[squeeze_node], name="ThenGraph", inputs=[then_in], outputs=[then_out]
+        nodes=[squeeze_node], name="ThenGraph", inputs=[], outputs=[then_out]
     )
 
     # Step 2: Build a subgraph for 'else_branch' (trivial pass-through):
-    else_in = helper.make_tensor_value_info("else_in", TensorProto.FLOAT, [None])
     else_out = helper.make_tensor_value_info("else_out", TensorProto.FLOAT, [None])
     identity_node = helper.make_node(
         "Identity",
-        inputs=["else_in"],
+        inputs=["X"],
         outputs=["else_out"],
         name="Identity_in_else_branch",
     )
     else_graph = helper.make_graph(
-        nodes=[identity_node], name="ElseGraph", inputs=[else_in], outputs=[else_out]
+        nodes=[identity_node], name="ElseGraph", inputs=[], outputs=[else_out]
     )
 
     # Step 3: Main graph:
@@ -150,9 +141,9 @@ def test_subgraph_with_if_mismatch():
 
     conv_node = helper.make_node(
         "Conv",
-        inputs=["X", "W"],  # Now has 2 inputs
+        inputs=["X", "W"],
         outputs=["ConvOut"],
-        name="BlockedConvNode",
+        name="ConvNode",
     )
 
     # If node: inputs -> cond, ConvOut => subgraphs => finalOut
@@ -160,23 +151,40 @@ def test_subgraph_with_if_mismatch():
     if_node = helper.make_node(
         "If",
         inputs=["cond"],
-        outputs=["FinalOut"],
+        outputs=["IfOut"],
         name="If_1",
         then_branch=then_graph,
         else_branch=else_graph,
     )
 
+    # Add a Relu node between If output and final output
+    relu_node = helper.make_node(
+        "Relu", inputs=["IfOut"], outputs=["FinalOut"], name="Relu_after_if"
+    )
+
     main_graph = helper.make_graph(
-        [conv_node, if_node],
-        "MainIfGraph",
+        [conv_node, if_node, relu_node],
+        "MainGraph",
         inputs=[cond_in, conv_in],
         outputs=[final_out],
         initializer=[W_init],
     )
     model = make_model(main_graph)
+    return model
 
-    # Block ALL nodes => remain float32
-    node_block_list = [conv_node.name, squeeze_node.name, identity_node.name]
+
+def test_subgraph_with_if_mismatch():
+    """
+    Reproduce an If node scenario with a subgraph that must remain float32
+    because its parent node is blocked.
+
+    We'll set keep_io_types=True to ensure the top-level inputs/outputs
+    also stay float32.
+    """
+    model = create_if_graph_model()
+
+    # Block ALL non-if nodes, and make sure the if tensor outputs match the if node's output type
+    node_block_list = ["ConvNode", "Squeeze_in_then_branch", "Identity_in_else_branch"]
 
     new_model = convert_float_to_float16(
         model,
@@ -602,6 +610,8 @@ def test_initializer_conversion():
         check_fp16_ready=False,
     )
 
+    validate_model(new_model, "test_initializer_conversion")
+
     # Verify W1 stayed float32 (used by blocked node) and W2 became float16
     for init in new_model.graph.initializer:
         if init.name == "W1":
@@ -643,7 +653,7 @@ def test_boundary_cast_insertion():
     # Convert with Relu blocked
     new_model = convert_float_to_float16(
         model,
-        keep_io_types=True,
+        keep_io_types=False,
         op_block_list=["Relu"],
         check_fp16_ready=False,
     )
@@ -737,10 +747,13 @@ def test_value_clamping():
         check_fp16_ready=False,
     )
 
+    validate_model(new_model, "test_value_clamping")
+
     # Extract the converted initializer data
     new_init = None
     for init in new_model.graph.initializer:
         if init.name == "data":
+            print(f"init", init)
             new_init = numpy_helper.to_array(init)
             break
 
