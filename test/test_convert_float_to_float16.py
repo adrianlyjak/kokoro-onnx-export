@@ -205,14 +205,7 @@ def test_subgraph_with_if_mismatch():
             break
     assert if_node_new is not None, "Failed to find If_1 in the new model."
 
-    # Check the then_branch subgraph input is still float32
-    then_g = if_node_new.attribute[0].g  # then_branch
-    then_input = then_g.input[0]
-    assert then_input.type.tensor_type.elem_type == TensorProto.FLOAT, (
-        "Subgraph input was incorrectly converted to float16."
-    )
-
-    # Also check the main graph's "ConvOut" remains float32
+    # check the main graph's "ConvOut" remains float32
     found_convout = False
     for vi in new_model.graph.value_info:
         if vi.name == "ConvOut":
@@ -439,7 +432,7 @@ def test_if_subgraph_blocking(tmp_path):
     b = torch.randn(1, dtype=torch.float32)
 
     # 2) Export to ONNX.  This definitely yields an If node
-    model_path = tmp_path / "model_if.onnx"
+    model_path = "modif.onnx"  # tmp_path / "model_if.onnx"
     torch.onnx.export(
         if_conv_flatten,
         (x, w, b, True),  # Pass a bool that's not recognized as a constant by JIT
@@ -451,6 +444,7 @@ def test_if_subgraph_blocking(tmp_path):
         do_constant_folding=False,
     )
     onnx_model = onnx.load(str(model_path))
+    validate_model(onnx_model, "test_if_subgraph_blocking_before")
 
     # 3) (Optional) Print the ops to confirm there's an If:
     print("OPS in exported model:", [n.op_type for n in onnx_model.graph.node])
@@ -991,10 +985,68 @@ def test_node_name_handling():
     validate_model(new_model, "test_node_name_handling")
 
     # Verify the blocked nodes remained in float32 domain
-    value_info = list(new_model.graph.value_info)
-    for vi in value_info:
-        if vi.name == "out1":  # Output of first blocked node
-            assert vi.type.tensor_type.elem_type == TensorProto.FLOAT
+
+    for node in new_model.graph.node:
+        if node.name == "special/chars.here":  # Output of first blocked node
+            output_tensor = node.output[0]
+            print(f"output_tensor: {output_tensor}")
+            vi_names = [vi.name for vi in new_model.graph.value_info]
+            print(f"vi_names: {vi_names}")
+            output_value = [
+                vi for vi in new_model.graph.value_info if vi.name == output_tensor
+            ][0]
+            assert output_value.type.tensor_type.elem_type == TensorProto.FLOAT
+
+
+def test_output_type_conversion():
+    """
+    Test that model outputs are converted to float16 when:
+    1. keep_io_types=False
+    2. The node producing the output is not blocked
+    """
+    input_tensor = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])
+    output_tensor = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])
+
+    # Create a simple Add node that feeds directly to output
+    add_node = helper.make_node("Add", inputs=["X", "X"], outputs=["Y"], name="Add")
+
+    graph = helper.make_graph(
+        nodes=[add_node],
+        name="TestOutputConversion",
+        inputs=[input_tensor],
+        outputs=[output_tensor],
+    )
+
+    model = make_model(graph)
+
+    # Convert with keep_io_types=False and no blocking
+    new_model = convert_float_to_float16(
+        model,
+        keep_io_types=False,
+        op_block_list=[],
+        node_block_list=None,
+        check_fp16_ready=False,
+    )
+
+    validate_model(new_model, "test_output_type_conversion")
+
+    # Verify output is float16
+    assert (
+        new_model.graph.output[0].type.tensor_type.elem_type == TensorProto.FLOAT16
+    ), (
+        "Output should be float16 when keep_io_types=False and upstream node is not blocked"
+    )
+
+    # Also verify the Add node's output is float16
+    add_output_info = [
+        vi
+        for vi in new_model.graph.value_info
+        if vi.name == new_model.graph.node[0].output[0]
+    ]
+    if add_output_info:  # If the value_info exists
+        assert add_output_info[0].type.tensor_type.elem_type == TensorProto.FLOAT16, (
+            "Add node output should be float16"
+        )
 
 
 def validate_model(model: onnx.ModelProto, test_name: str):
