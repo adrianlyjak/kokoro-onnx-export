@@ -283,12 +283,19 @@ def _create_cast_to(
     ti.cast_output_node = cast_output
     ti.cast_output = cast_output_tensor_name
 
-    if create_value_info:
-        new_vi = ti.graph.value_info.add()
-        new_vi.name = cast_output_tensor_name
-        new_vi.type.tensor_type.elem_type = cast_to
-        if isinstance(ti.proto, ValueInfoProto):
-            new_vi.type.tensor_type.shape.CopyFrom(ti.proto.type.tensor_type.shape)
+    # if create_value_info:
+    #     new_vi = ti.graph.value_info.add()
+    #     new_vi.name = cast_output_tensor_name
+    #     new_vi.type.tensor_type.elem_type = cast_to
+    #     if isinstance(ti.proto, ValueInfoProto):
+    #         # if ti.name() == "/decoder/generator/Unsqueeze_1_output_0":
+    #         print(
+    #             f"CAST TO {ti.name()} SHAPE:",
+    #             ti.proto.type.tensor_type.shape,
+    #             "type:",
+    #             ti.proto.type.tensor_type.elem_type,
+    #         )
+    #         new_vi.type.tensor_type.shape.CopyFrom(ti.proto.type.tensor_type.shape)
 
 
 def _create_cast_from(
@@ -314,11 +321,19 @@ def _create_cast_from(
     ti.cast_input_node = cast_input_node
     ti.cast_input = cast_input_tensor_name
 
-    new_vi = ti.graph.value_info.add()
-    new_vi.name = cast_input_tensor_name
-    new_vi.type.tensor_type.elem_type = cast_from
-    if isinstance(ti.proto, ValueInfoProto):
-        new_vi.type.tensor_type.shape.CopyFrom(ti.proto.type.tensor_type.shape)
+    # new_vi = ti.graph.value_info.add()
+    # new_vi.name = cast_input_tensor_name
+    # new_vi.type.tensor_type.elem_type = cast_from
+    # if isinstance(ti.proto, ValueInfoProto):
+    #     # if ti.name() == "/decoder/generator/Unsqueeze_1_output_0":
+    #     print(
+    #         f"CAST FROM {ti.name()} SHAPE:",
+    #         ti.proto.type.tensor_type.shape,
+    #         "type:",
+    #         ti.proto.type.tensor_type.elem_type,
+    #     )
+    #     if ti.name() != "/decoder/generator/Unsqueeze_1_output_0":
+    #         new_vi.type.tensor_type.shape.CopyFrom(ti.proto.type.tensor_type.shape)
 
 
 @dataclass
