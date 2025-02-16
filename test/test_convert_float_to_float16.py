@@ -1049,6 +1049,117 @@ def test_output_type_conversion():
         )
 
 
+def test_existing_cast_input():
+    """
+    Test conversion when there's an existing Cast node from int64 to float32 as input.
+    The existing Cast should be modified to output float16 instead of adding a new Cast.
+    """
+    # Create graph: input(int64) -> Cast(to float32) -> Add -> output
+    input_tensor = helper.make_tensor_value_info("X", TensorProto.INT64, [1, 4])
+    output_tensor = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])
+
+    # Create Cast node from INT64 to FLOAT
+    cast_node = helper.make_node(
+        "Cast",
+        inputs=["X"],
+        outputs=["cast_out"],
+        name="cast",
+        to=TensorProto.FLOAT,  # Original cast to float32
+    )
+
+    add_node = helper.make_node(
+        "Add",
+        inputs=["cast_out", "cast_out"],
+        outputs=["Y"],
+        name="add",
+    )
+
+    graph = helper.make_graph(
+        nodes=[cast_node, add_node],
+        name="TestExistingCastInput",
+        inputs=[input_tensor],
+        outputs=[output_tensor],
+    )
+
+    model = make_model(graph)
+
+    # Convert to float16
+    new_model = convert_float_to_float16(
+        model,
+        keep_io_types=False,
+        check_fp16_ready=False,
+    )
+
+    validate_model(new_model, "test_existing_cast_input")
+
+    # Verify:
+    # 1. The original Cast node now outputs float16
+    # 2. No new Cast nodes were added
+    cast_nodes = [n for n in new_model.graph.node if n.op_type == "Cast"]
+    assert len(cast_nodes) == 1, "Expected exactly one Cast node"
+    assert cast_nodes[0].attribute[0].i == TensorProto.FLOAT16, (
+        "Original Cast node should now output float16"
+    )
+
+
+def test_existing_cast_output():
+    """
+    Test conversion when there's an existing Cast node from float32 to int64 as output.
+    The float32 input to the existing Cast should become float16 without adding a new Cast.
+    """
+    # Create graph: input -> Add -> Cast(to int64) -> output
+    input_tensor = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])
+    output_tensor = helper.make_tensor_value_info("Y", TensorProto.INT64, [1, 4])
+
+    add_node = helper.make_node(
+        "Add",
+        inputs=["X", "X"],
+        outputs=["add_out"],
+        name="add",
+    )
+
+    # Create Cast node from FLOAT to INT64
+    cast_node = helper.make_node(
+        "Cast",
+        inputs=["add_out"],
+        outputs=["Y"],
+        name="cast",
+        to=TensorProto.INT64,
+    )
+
+    graph = helper.make_graph(
+        nodes=[add_node, cast_node],
+        name="TestExistingCastOutput",
+        inputs=[input_tensor],
+        outputs=[output_tensor],
+    )
+
+    model = make_model(graph)
+
+    # Convert to float16
+    new_model = convert_float_to_float16(
+        model,
+        keep_io_types=False,
+        check_fp16_ready=False,
+    )
+
+    validate_model(new_model, "test_existing_cast_output")
+
+    # Verify:
+    # 1. The Add node outputs float16
+    # 2. The Cast node takes float16 input
+    # 3. No new Cast nodes were added
+    cast_nodes = [n for n in new_model.graph.node if n.op_type == "Cast"]
+    assert len(cast_nodes) == 1, "Expected exactly one Cast node"
+
+    # Find the value_info for add_out to verify it's float16
+    add_output_info = [vi for vi in new_model.graph.value_info if vi.name == "add_out"]
+    assert len(add_output_info) > 0, "Could not find add_out value_info"
+    assert add_output_info[0].type.tensor_type.elem_type == TensorProto.FLOAT16, (
+        "Add node should output float16"
+    )
+
+
 def validate_model(model: onnx.ModelProto, test_name: str):
     """
     Helper to validate an ONNX model by:

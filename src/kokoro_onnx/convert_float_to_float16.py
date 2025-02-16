@@ -114,7 +114,7 @@ def convert_float_to_float16(
     #   if one of its inputs or outputs is not blocked, convert to fp16
     #   if converted, and any of its inputs or outputs are blocked, insert a cast, and reconnect the node to the cast node
     tensor_infos, all_graphs = _build_tensor_infos(model.graph)
-    checker = _is_blocked_checker(op_block_list, node_block_list)
+    checker = _is_blocked_checker(op_block_list.union({"Cast"}), node_block_list)
     used_names = set()
     for graph in all_graphs:
         for node in graph.node:
@@ -123,7 +123,13 @@ def convert_float_to_float16(
         used_names.add(ti.name())
     for ti in tensor_infos:
         _modify_graph_for_tensor_info(
-            ti, checker, keep_io_types, used_names, min_positive_val, max_finite_val
+            ti,
+            checker,
+            keep_io_types,
+            used_names,
+            min_positive_val,
+            max_finite_val,
+            tensor_infos,
         )
     for graph in all_graphs:
         for node in graph.node:
@@ -154,6 +160,7 @@ def _modify_graph_for_tensor_info(
     used_node_names: set[str],
     min_positive_val: float,
     max_finite_val: float,
+    hack: list["TensorInfo"] = [],
 ) -> None:
     if ti.data_type() != FLOAT32:
         return
@@ -191,13 +198,16 @@ def _modify_graph_for_tensor_info(
                 if input_name == ti.name():
                     output_node.input[i] = cast_output
     for parent_node in parent_node_if_output:
-        parent_node_type = FLOAT32 if is_node_blocked(parent_node) else FLOAT16
-        if parent_node_type != desired_type:
+        parent_node_desired_type = FLOAT32 if is_node_blocked(parent_node) else FLOAT16
+        if parent_node_desired_type != desired_type:
             cast_output_node = ti.cast_output_node
             cast_output = ti.cast_output
             if not cast_output_node:
                 _create_cast_to(
-                    ti, parent_node_type, used_node_names, create_value_info=False
+                    ti,
+                    parent_node_desired_type,
+                    used_node_names,
+                    create_value_info=False,
                 )
                 cast_output_node = ti.cast_output_node
                 cast_output = ti.cast_output
@@ -208,11 +218,10 @@ def _modify_graph_for_tensor_info(
             ti.graph.output.remove(old_output)
             new_output_vi = ti.graph.output.add()
             new_output_vi.name = cast_output
-            new_output_vi.type.tensor_type.elem_type = parent_node_type
-            if isinstance(old_output, ValueInfoProto):
-                new_output_vi.type.tensor_type.shape.CopyFrom(
-                    old_output.type.tensor_type.shape
-                )
+            new_output_vi.type.tensor_type.elem_type = parent_node_desired_type
+            new_output_vi.type.tensor_type.shape.CopyFrom(
+                old_output.type.tensor_type.shape
+            )
     for input_node in ti.input_nodes:
         input_node_type = FLOAT32 if is_node_blocked(input_node) else FLOAT16
         if input_node_type != desired_type:
@@ -283,19 +292,12 @@ def _create_cast_to(
     ti.cast_output_node = cast_output
     ti.cast_output = cast_output_tensor_name
 
-    # if create_value_info:
-    #     new_vi = ti.graph.value_info.add()
-    #     new_vi.name = cast_output_tensor_name
-    #     new_vi.type.tensor_type.elem_type = cast_to
-    #     if isinstance(ti.proto, ValueInfoProto):
-    #         # if ti.name() == "/decoder/generator/Unsqueeze_1_output_0":
-    #         print(
-    #             f"CAST TO {ti.name()} SHAPE:",
-    #             ti.proto.type.tensor_type.shape,
-    #             "type:",
-    #             ti.proto.type.tensor_type.elem_type,
-    #         )
-    #         new_vi.type.tensor_type.shape.CopyFrom(ti.proto.type.tensor_type.shape)
+    if create_value_info:
+        new_vi = ti.graph.value_info.add()
+        new_vi.name = cast_output_tensor_name
+        new_vi.type.tensor_type.elem_type = cast_to
+        if isinstance(ti.proto, ValueInfoProto):
+            new_vi.type.tensor_type.shape.CopyFrom(ti.proto.type.tensor_type.shape)
 
 
 def _create_cast_from(
@@ -321,19 +323,11 @@ def _create_cast_from(
     ti.cast_input_node = cast_input_node
     ti.cast_input = cast_input_tensor_name
 
-    # new_vi = ti.graph.value_info.add()
-    # new_vi.name = cast_input_tensor_name
-    # new_vi.type.tensor_type.elem_type = cast_from
-    # if isinstance(ti.proto, ValueInfoProto):
-    #     # if ti.name() == "/decoder/generator/Unsqueeze_1_output_0":
-    #     print(
-    #         f"CAST FROM {ti.name()} SHAPE:",
-    #         ti.proto.type.tensor_type.shape,
-    #         "type:",
-    #         ti.proto.type.tensor_type.elem_type,
-    #     )
-    #     if ti.name() != "/decoder/generator/Unsqueeze_1_output_0":
-    #         new_vi.type.tensor_type.shape.CopyFrom(ti.proto.type.tensor_type.shape)
+    new_vi = ti.graph.value_info.add()
+    new_vi.name = cast_input_tensor_name
+    new_vi.type.tensor_type.elem_type = cast_from
+    if isinstance(ti.proto, ValueInfoProto):
+        new_vi.type.tensor_type.shape.CopyFrom(ti.proto.type.tensor_type.shape)
 
 
 @dataclass
@@ -394,10 +388,10 @@ def _build_tensor_infos(
     graph_stack: list[tuple[onnx.GraphProto, Optional[NodeProto]]] = [
         (root_graph, None)
     ]
-    all_graphs: list[onnx.GraphProto] = []
+    all_graphs: list[tuple[onnx.GraphProto, Optional[NodeProto]]] = []
     while graph_stack:
         curr_graph, parent_node = graph_stack.pop()
-        all_graphs.append(curr_graph)
+        all_graphs.append((curr_graph, parent_node))
         for node in curr_graph.node:
             for input_name in node.input:
                 tensor_to_outputs[input_name].append(node)
@@ -410,7 +404,7 @@ def _build_tensor_infos(
                     if g.node:
                         graph_stack.append((g, node))
 
-    for graph in all_graphs:
+    for graph, parent_node in all_graphs:
         is_root = graph == root_graph
         for vi in graph.input:
             tensor_infos.append(
@@ -453,7 +447,7 @@ def _build_tensor_infos(
                     input_nodes=tensor_to_input[tensor.name],
                 )
             )
-    return tensor_infos, all_graphs
+    return tensor_infos, [g for (g, _) in all_graphs]
 
 
 def _npfloat16_to_int(np_list):

@@ -263,130 +263,6 @@ class CsvCalibrationDataReader(CalibrationDataReader):
         self.progress.reset(self.task)
 
 
-def debug_if_node(model, if_node_name="/If", blocked_node_names=[]):
-    """Debug the inputs and outputs around a specific If node."""
-    print("\nDebugging If node and surrounding graph:")
-
-    # Find the If node
-    if_node = None
-    for node in model.graph.node:
-        if node.name == if_node_name:
-            if_node = node
-            break
-
-    if not if_node:
-        print(f"Could not find node {if_node_name}")
-        return
-
-    # Get value_info for all tensors
-    value_info = {vi.name: vi for vi in model.graph.value_info}
-    value_info.update({vi.name: vi for vi in model.graph.input})
-    value_info.update({vi.name: vi for vi in model.graph.output})
-
-    # Print If node details
-    print(f"\nIf Node: {if_node.name}")
-    print("\nInputs:")
-    for i, input_name in enumerate(if_node.input):
-        if input_name in value_info:
-            dtype = value_info[input_name].type.tensor_type.elem_type
-            print(f"  {i}: {input_name} (type: {dtype})")
-        else:
-            print(f"  {i}: {input_name} (type: unknown)")
-
-    print("\nOutputs:")
-    for i, output_name in enumerate(if_node.output):
-        if output_name in value_info:
-            dtype = value_info[output_name].type.tensor_type.elem_type
-            print(f"  {i}: {output_name} (type: {dtype})")
-        else:
-            print(f"  {i}: {output_name} (type: unknown)")
-
-    # Find nodes that feed into this If node
-    print("\nUpstream nodes:")
-    for node in model.graph.node:
-        if any(output in if_node.input for output in node.output):
-            print(f"\n  Node: {node.name} (op: {node.op_type})")
-            print("  Outputs:")
-            for output in node.output:
-                if output in value_info:
-                    dtype = value_info[output].type.tensor_type.elem_type
-                    print(f"    - {output} (type: {dtype})")
-                else:
-                    print(f"    - {output} (type: unknown)")
-
-    # Find nodes that consume this If node's outputs
-    print("\nDownstream nodes:")
-    for node in model.graph.node:
-        if any(input in if_node.output for input in node.input):
-            print(f"\n  Node: {node.name} (op: {node.op_type})")
-            print("  Inputs:")
-            for input in node.input:
-                if input in value_info:
-                    dtype = value_info[input].type.tensor_type.elem_type
-                    print(f"    - {input} (type: {dtype})")
-                else:
-                    print(f"    - {input} (type: unknown)")
-
-    # Print complete subgraph information
-    for attr in if_node.attribute:
-        if attr.name in ("then_branch", "else_branch"):
-            print(f"\n{attr.name} subgraph:")
-            subgraph = attr.g
-
-            # Build value info lookup for subgraph
-            subgraph_value_info = {vi.name: vi for vi in subgraph.value_info}
-            subgraph_value_info.update({vi.name: vi for vi in subgraph.input})
-            subgraph_value_info.update({vi.name: vi for vi in subgraph.output})
-            subgraph_value_info.update(
-                {init.name: init for init in subgraph.initializer}
-            )
-
-            print("\n  Inputs:")
-            for input in subgraph.input:
-                print(f"    - {input.name} (type: {input.type.tensor_type.elem_type})")
-
-            print("\n  Outputs:")
-            for output in subgraph.output:
-                print(
-                    f"    - {output.name} (type: {output.type.tensor_type.elem_type})"
-                )
-
-            print("\n  Nodes:")
-            for node in subgraph.node:
-                is_blocked = (
-                    "(BLOCKED)" if node.name in blocked_node_names else "(not blocked)"
-                )
-                print(f"    Node: {node.name} {is_blocked} (op: {node.op_type})")
-                print("    Inputs:")
-                for input in node.input:
-                    dtype = "unknown"
-                    if input in subgraph_value_info:
-                        vi = subgraph_value_info[input]
-                        if hasattr(vi, "type"):
-                            dtype = vi.type.tensor_type.elem_type
-                        elif hasattr(vi, "data_type"):
-                            dtype = vi.data_type
-                    print(f"      - {input} (type: {dtype})")
-                print("    Outputs:")
-                for output in node.output:
-                    dtype = "unknown"
-                    if output in subgraph_value_info:
-                        vi = subgraph_value_info[output]
-                        if hasattr(vi, "type"):
-                            dtype = vi.type.tensor_type.elem_type
-                        elif hasattr(vi, "data_type"):
-                            dtype = vi.data_type
-                    print(f"      - {output} (type: {dtype})")
-
-            print("\n  Initializers:")
-            for init in subgraph.initializer:
-                print(f"    - {init.name} (shape: {init.dims}, type: {init.data_type})")
-
-            print("\n  Value Info:")
-            for vi in subgraph.value_info:
-                print(f"    - {vi.name} (type: {vi.type.tensor_type.elem_type})")
-
-
 @app.command()
 def float16(
     model_path: str = typer.Option(
@@ -445,12 +321,10 @@ def float16(
     model_fp16 = convert_float_to_float16(
         model,
         keep_io_types=True,
-        node_block_list=node_block_list,
+        # node_block_list=node_block_list,
     )
     print(f"\nSaving model to {output_path}...")
     onnx.save(model_fp16, output_path)
-
-    debug_if_node(model_fp16, blocked_node_names=node_block_list)
 
     # Test converted model
     print("\nTesting converted model...")
