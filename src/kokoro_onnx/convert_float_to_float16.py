@@ -14,7 +14,6 @@ from onnx import (
     TensorProto,
     ValueInfoProto,
     helper,
-    numpy_helper,
 )
 from onnx import onnx_pb as onnx_proto
 
@@ -86,6 +85,13 @@ def convert_float_to_float16(
     else:
         node_block_list = set(node_block_list)
     op_block_list = set(op_block_list)
+
+    # Force shape inference before conversion if not disabled
+    if not disable_shape_infer:
+        try:
+            model = onnx.shape_inference.infer_shapes(model)
+        except Exception as e:
+            warnings.warn(f"Shape inference failed: {str(e)}")
 
     # Basic checking, optional shape inference
     model, func_infer_shape, is_fp16_ready_flag = initial_checking(
@@ -162,6 +168,13 @@ def _modify_graph_for_tensor_info(
     max_finite_val: float,
     hack: list["TensorInfo"] = [],
 ) -> None:
+    # Check if type is explicitly set or inferred
+    has_explicit_type = (
+        isinstance(ti.proto, ValueInfoProto)
+        and ti.proto.type.HasField("tensor_type")
+        and ti.proto.type.tensor_type.HasField("elem_type")
+    )
+
     if ti.data_type() != FLOAT32:
         return
     desired_type = FLOAT32
@@ -183,7 +196,7 @@ def _modify_graph_for_tensor_info(
                     ti.proto, min_positive_val, max_finite_val
                 )
             )
-        else:
+        elif has_explicit_type:
             ti.proto.type.tensor_type.elem_type = FLOAT16
     for output_node in ti.output_nodes:
         node_type = FLOAT32 if is_node_blocked(output_node) else FLOAT16
@@ -255,6 +268,17 @@ def _modify_node_attribute_type(
                 t.CopyFrom(
                     convert_tensor_float_to_float16(t, min_positive_val, max_finite_val)
                 )
+        # Handle dtype attributes for ops that generate tensors
+        # Ops that have a dtype attribute that should be converted from float32 to float16
+        # dtype_ops = {
+        #     "RandomNormalLike",
+        #     "RandomNormal",
+        #     "RandomUniform",
+        #     "RandomUniformLike"
+        # }
+        if attr.name == "dtype":
+            if attr.i == onnx_proto.TensorProto.FLOAT:
+                attr.i = onnx_proto.TensorProto.FLOAT16
 
 
 def _create_unique_name(base_name: str, used_node_names: set[str]) -> str:
@@ -295,9 +319,16 @@ def _create_cast_to(
     if create_value_info:
         new_vi = ti.graph.value_info.add()
         new_vi.name = cast_output_tensor_name
-        new_vi.type.tensor_type.elem_type = cast_to
         if isinstance(ti.proto, ValueInfoProto):
-            new_vi.type.tensor_type.shape.CopyFrom(ti.proto.type.tensor_type.shape)
+            if ti.proto.type.HasField("tensor_type"):
+                if ti.proto.type.tensor_type.HasField("elem_type"):
+                    new_vi.type.tensor_type.elem_type = cast_to
+                if ti.proto.type.tensor_type.HasField("shape"):
+                    new_vi.type.tensor_type.shape.CopyFrom(
+                        ti.proto.type.tensor_type.shape
+                    )
+        else:
+            new_vi.type.tensor_type.elem_type = cast_to
 
 
 def _create_cast_from(
@@ -325,9 +356,14 @@ def _create_cast_from(
 
     new_vi = ti.graph.value_info.add()
     new_vi.name = cast_input_tensor_name
-    new_vi.type.tensor_type.elem_type = cast_from
     if isinstance(ti.proto, ValueInfoProto):
-        new_vi.type.tensor_type.shape.CopyFrom(ti.proto.type.tensor_type.shape)
+        if ti.proto.type.HasField("tensor_type"):
+            if ti.proto.type.tensor_type.HasField("elem_type"):
+                new_vi.type.tensor_type.elem_type = cast_from
+            if ti.proto.type.tensor_type.HasField("shape"):
+                new_vi.type.tensor_type.shape.CopyFrom(ti.proto.type.tensor_type.shape)
+    else:
+        new_vi.type.tensor_type.elem_type = cast_from
 
 
 @dataclass

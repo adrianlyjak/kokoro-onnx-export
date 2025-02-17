@@ -20,7 +20,8 @@ from onnxruntime.quantization import (
 )
 from onnxruntime.quantization.calibrate import CalibrationDataReader
 from onnxruntime.quantization.shape_inference import quant_pre_process
-from rich import print
+
+# from rich import print
 from rich.progress import (
     BarColumn,
     Progress,
@@ -321,15 +322,21 @@ def float16(
     model_fp16 = convert_float_to_float16(
         model,
         keep_io_types=True,
-        # node_block_list=node_block_list,
+        node_block_list=node_block_list,
     )
     print(f"\nSaving model to {output_path}...")
     onnx.save(model_fp16, output_path)
 
     # Test converted model
     print("\nTesting converted model...")
-    sess_fp16 = ort.InferenceSession(output_path, providers=["CPUExecutionProvider"])
-    fp16_outputs = sess_fp16.run(None, inputs)
+    try:
+        sess_fp16 = ort.InferenceSession(
+            output_path, providers=["CPUExecutionProvider"]
+        )
+        fp16_outputs = sess_fp16.run(None, inputs)
+    except Exception as e:
+        print(f"Error testing converted model: {e}")
+        raise
 
     # Replace node type counting with model diffing
     print("\nComparing original and converted models:")
