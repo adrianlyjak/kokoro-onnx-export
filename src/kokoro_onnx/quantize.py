@@ -53,6 +53,7 @@ def quantize_neural_compressor(
     samples: Optional[int] = typer.Option(
         None, help="Number of samples to use for calibration"
     ),
+    trials: int = typer.Option(500, help="Number of trials to run for quantization"),
     eval_text: str = typer.Option(
         "Despite its lightweight architecture, it delivers comparable quality to larger models",
         help="Text to evaluate the model with",
@@ -81,7 +82,10 @@ def quantize_neural_compressor(
     def eval_func(model: onnx.ModelProto):
         inputs = get_onnx_inputs(eval_voice, eval_text, vocab)
         sess = ort.InferenceSession(
-            model.SerializeToString(), providers=["CPUExecutionProvider"]
+            model.SerializeToString(),
+            providers=["CUDAExecutionProvider"]
+            if torch.cuda.is_available()
+            else ["CPUExecutionProvider"],
         )
         outputs = sess.run(None, inputs)[0]
         return mel_spectrogram_distance(init_outputs, outputs, distance_type="L2")
@@ -99,7 +103,7 @@ def quantize_neural_compressor(
             approach="static",
             tuning_criterion=TuningCriterion(
                 timeout=0,
-                max_trials=10,
+                max_trials=trials,
             ),
             accuracy_criterion=AccuracyCriterion(
                 higher_is_better=False,
