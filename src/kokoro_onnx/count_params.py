@@ -29,6 +29,12 @@ def count(
     size: bool = typer.Option(
         False, help="Count parameter sizes instead of number of nodes"
     ),
+    filter_op: str = typer.Option(
+        None, help="Only count nodes/params with this operation type"
+    ),
+    filter_name: str = typer.Option(
+        None, help="Only count nodes/params with names starting with this prefix"
+    ),
 ):
     """
     Analyzes an ONNX model, counting nodes or parameters by operation type or name prefix.
@@ -52,6 +58,14 @@ def count(
                 else name
             )
 
+    # Filter function to check if a node/parameter should be counted
+    def should_count(name: str, op_type: str = None) -> bool:
+        if filter_op and (op_type != filter_op):
+            return False
+        if filter_name and not name.startswith(filter_name):
+            return False
+        return True
+
     # Count either nodes or parameters
     if size:
         # Map inputs to op types for parameter counting
@@ -66,6 +80,9 @@ def count(
 
         # Count initializers
         for initializer in model.graph.initializer:
+            if not should_count(initializer.name, input_to_op.get(initializer.name)):
+                continue
+                
             num_params = np.prod(initializer.dims)
             param_size_bytes = num_params * 4  # Assuming FP32
 
@@ -75,6 +92,9 @@ def count(
 
         # Count embedded tensors in nodes
         for node in model.graph.node:
+            if not should_count(node.name, node.op_type):
+                continue
+                
             group = get_group(node.name, node.op_type)
 
             # Handle Constant nodes which contain embedded tensor data
@@ -123,6 +143,8 @@ def count(
         # Count nodes
         counts: Dict[str, int] = defaultdict(int)
         for node in model.graph.node:
+            if not should_count(node.name, node.op_type):
+                continue
             group = get_group(node.name, node.op_type)
             counts[group] += 1
 

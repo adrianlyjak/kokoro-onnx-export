@@ -4,20 +4,34 @@ from pathlib import Path
 import numpy as np
 import onnx
 import onnxruntime as ort
+import onnxscript
 import torch
 import typer
-from huggingface_hub import hf_hub_download
 from kokoro.model import KModel, KModelForONNX
-from kokoro.pipeline import KPipeline
+from onnxruntime.quantization import shape_inference
 from rich import print
+from torch.nn import utils
+
+from kokoro_onnx.quantize import get_onnx_inputs
 
 from .cli import app
-from .util import execution_providers, mel_spectrogram_distance
+from .util import execution_providers, load_vocab, mel_spectrogram_distance
+from .verify import verify
 
 
 @app.command()
 def export(
     output_path: str = typer.Option("kokoro.onnx", help="Path to save the ONNX model"),
+    remove_weight_norm: bool = typer.Option(
+        True, help="Remove weight norm from the model"
+    ),
+    quant_preprocess: bool = typer.Option(
+        True, help="Preprocess the model for quantization after exporting"
+    ),
+    score_difference: bool = typer.Option(
+        True,
+        help="Score the difference between the Torch and ONNX model for a test input after exporting",
+    ),
 ) -> None:
     """
     Export the Kokoro model to ONNX format.
@@ -42,10 +56,18 @@ def export(
     # Style reference tensor
     style = torch.randn(batch_size, style_dim)
 
-    # Validate the inputs against the model first
-    start_time = time.time()
-    output = model(input_ids=input_ids, ref_s=style, speed=dummy_speed)
-    print(f"Time for dummy inputs: {time.time() - start_time}")
+    def remove_weight_norm_recursive(module):
+        for child in module.children():
+            if hasattr(child, "weight_v"):
+                # This module has weight norm
+                utils.remove_weight_norm(child)
+            else:
+                # Recursively check this module's children
+                remove_weight_norm_recursive(child)
+
+    # Use it on your whole model
+    if remove_weight_norm:
+        remove_weight_norm_recursive(model)
 
     # Define dynamic axes
     dynamic_axes = {
@@ -67,29 +89,24 @@ def export(
         do_constant_folding=True,
     )
 
-    # Verify the model
     onnx_model = onnx.load(output_path)
+    if quant_preprocess:
+        print("Pre-processing model for quantization...")
+        shape_inference.quant_pre_process(
+            onnx_model, output_model_path=output_path, skip_symbolic_shape=True
+        )
+        onnx_model = onnx.load(output_path)
+
+    # validate the model
     onnx.checker.check_model(onnx_model)
+
     print("Model was successfully exported to ONNX")
 
-    # Additional check: Run a simple inference to validate the exported model
-    ort_session = ort.InferenceSession(
-        str(output_path),
-        providers=execution_providers,
-    )
-    ort_inputs = {
-        "input_ids": input_ids.numpy(),
-        "style": style.numpy(),
-        "speed": np.array([dummy_speed], dtype=np.float32),
-    }
-    ort_outputs = ort_session.run(None, ort_inputs)
-
-    # Compare audio output
-    torch_audio = output
-    onnx_audio = torch.tensor(ort_outputs[0])
-    difference_score = mel_spectrogram_distance(torch_audio, onnx_audio)
-    print(f"Audio difference score: {difference_score:.5f}")
-    if torch_audio.shape[-1] != onnx_audio.shape[-1]:
-        print(
-            f"Original lengths - Torch: {torch_audio.shape[-1]}, ONNX: {onnx_audio.shape[-1]}"
+    if score_difference:
+        verify(
+            onnx_path=output_path,
+            text="Despite its lightweight architecture, it delivers comparable quality to larger models",
+            voice="af_heart",
+            output_dir=None,
+            profile=False,
         )

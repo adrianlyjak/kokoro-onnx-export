@@ -2,7 +2,7 @@ import csv
 import json
 import re
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Generator, Optional
 
 import numpy as np
 import onnx
@@ -11,6 +11,8 @@ import torch
 import typer
 from huggingface_hub import hf_hub_download
 from kokoro.pipeline import KPipeline
+from neural_compressor import PostTrainingQuantConfig, quantization
+from neural_compressor.config import AccuracyCriterion, TuningCriterion
 from onnxconverter_common.auto_mixed_precision import auto_convert_mixed_precision
 from onnxruntime.quantization import (
     CalibrationMethod,
@@ -37,32 +39,100 @@ from .convert_float_to_float16 import convert_float_to_float16
 from .util import mel_spectrogram_distance
 
 
-def get_onnx_inputs(
-    voice: str, text: str, vocab: dict[str, int]
-) -> dict[str, np.ndarray]:
-    """Process text into corresponding ONNX inputs."""
+@app.command()
+def quantize_neural_compressor(
+    model_path: str = typer.Option(
+        "kokoro.onnx", help="Path to the ONNX model to quantize"
+    ),
+    output_path: str = typer.Option(
+        "kokoro_quantized.onnx", help="Path to save the quantized model"
+    ),
+    calibration_data: str = typer.Option(
+        "data/quant-calibration.csv", help="Path to calibration data CSV"
+    ),
+    samples: Optional[int] = typer.Option(
+        None, help="Number of samples to use for calibration"
+    ),
+    eval_text: str = typer.Option(
+        "Despite its lightweight architecture, it delivers comparable quality to larger models",
+        help="Text to evaluate the model with",
+    ),
+    eval_voice: str = typer.Option("af_heart", help="Voice to evaluate the model with"),
+) -> None:
+    """
+    Quantize an ONNX model using the Neural Compressor library.
 
-    lang_code = voice[0]
-    pipeline = KPipeline(lang_code=lang_code, model=False)
+    Args:
+        model_path: Path to the input ONNX model
+        output_path: Path to save the quantized model
+    """
+    print("Starting quantization process...")
 
-    # Get tokens from pipeline
-    for result in pipeline(text):
-        phoneme_output = result[1]
-        break
+    model = onnx.load(model_path)
+    vocab = load_vocab()
 
-    # Convert phonemes to input_ids
-    tokens = [x for x in map(lambda p: vocab.get(p), phoneme_output) if x is not None]
-    input_ids = torch.LongTensor([[0, *tokens, 0]])
+    inputs = get_onnx_inputs(eval_voice, eval_text, vocab)
 
-    # Load and process the style vector
-    ref_s = pipeline.load_voice(voice)
-    ref_s = ref_s[input_ids.shape[1] - 1]
+    init_session = ort.InferenceSession(
+        model.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    init_outputs = init_session.run(None, inputs)[0]
 
-    return {
-        "input_ids": input_ids.numpy(),
-        "style": ref_s.numpy(),
-        "speed": np.array([1.0], dtype=np.float32),
-    }
+    def eval_func(model: onnx.ModelProto):
+        inputs = get_onnx_inputs(eval_voice, eval_text, vocab)
+        sess = ort.InferenceSession(
+            model.SerializeToString(), providers=["CPUExecutionProvider"]
+        )
+        outputs = sess.run(None, inputs)[0]
+        return mel_spectrogram_distance(init_outputs, outputs, distance_type="L2")
+
+    calibration_dataloader = NeuralCalibrationDataloader(
+        calibration_data, num_samples=samples, vocab=vocab
+    )
+
+    quantized_model = quantization.fit(
+        model,
+        conf=PostTrainingQuantConfig(
+            excluded_precisions=["bf16"],
+            quant_format="QOperator",
+            approach="static",
+            tuning_criterion=TuningCriterion(
+                timeout=0,
+                max_trials=10,
+            ),
+            accuracy_criterion=AccuracyCriterion(
+                higher_is_better=False,
+                criterion="absolute",
+                tolerable_loss=1.3,
+            ),
+        ),
+        calib_dataloader=calibration_dataloader,
+        eval_func=eval_func,
+    )
+    quantized_model.save(output_path)
+
+
+class NeuralCalibrationDataloader:
+    def __init__(
+        self,
+        path: str,
+        num_samples: Optional[int] = None,
+        vocab: Optional[dict[str, int]] = None,
+    ):
+        self.vocab = vocab or load_vocab()
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            self.calibration_rows = list(reader)
+        if num_samples is None:
+            self.num_samples = len(self.calibration_rows)
+        else:
+            self.num_samples = num_samples
+        self.batch_size = 1
+
+    def __iter__(self):
+        for row in self.calibration_rows[: self.num_samples]:
+            inputs = get_onnx_inputs(row["Voice"], row["Text"], self.vocab)
+            yield inputs, None
 
 
 @app.command()
@@ -109,8 +179,8 @@ def quantize(
 
     ops_to_include = [
         # "Add",
-        "Mul",
-        "Div",
+        # "Mul",
+        # "Div",
         # "Slice",
         # "Reshape",
         # "Unsqueeze",
@@ -121,7 +191,7 @@ def quantize(
         # "MatMul",
         # "Shape",
         # "Div",
-        # "Conv",
+        "Conv",
         # "Sqrt",
         # "Concat",
         # "Gemm",
@@ -182,20 +252,21 @@ def quantize(
             | ^/decoder/decode\.\d/conv2.* # for all 0.00003 increase in loss, not discernable to my ear. 12 layers, this knocks down 4
             | ^/decoder/decode\..* # the rest
             | ^/N\..* # no loss
-            | ^/decoder/generator/resblocks\.[0].* # LOTS of params. From 0 to 5, each with 3 convs, so 15 layers. 0.00009 increase in loss if all are included. Certain hollowness to the sound. Limit to middle convolutions doesn't help much, but first layer doesn't seem to hurt
-            # | ^/decoder/generator/resblocks\..* # the rest
+            # | ^/decoder/generator/resblocks\.[0].* # LOTS of params. From 0 to 5, each with 3 convs, so 15 layers. 0.00009 increase in loss if all are included. Certain hollowness to the sound. Limit to middle convolutions doesn't help much, but first layer doesn't seem to hurt
+            | ^/decoder/generator/resblocks\..* # the rest
             | ^/decoder/generator/noise_convs\.\d/Conv
-            # | ^/decoder/generator/Conv.* # 0.00002 loss, for 2 layers
+            | ^/decoder/generator/Conv.* # 0.00002 loss, for 2 layers
             # | ^/F0_proj/Conv # ginormous loss
             | ^/N_proj/Conv # 0.00001 loss, for 1 layer
             # | ^/F0\..* # terrible jump in loss. Lots of static
             # | ^/decoder/generator/conv_post/Conv # huge loss
             | ^/decoder/encode/conv2/Conv # 0.00002 loss, for 1 layer
             | ^/decoder/encode/.* # 0.00004 loss, for 3 layers
+            | ^kmodel\.decoder.* # tons of things
         )
         """
     )
-    regex = re.compile(r"kmodel\.decoder.*")
+    # regex = re.compile(r"kmodel\.decoder.*")
     # Count each node type
     for node in model.graph.node:
         if node.op_type in ops_to_include:
@@ -210,7 +281,7 @@ def quantize(
         model_input=model_path,
         model_output=output_path,
         calibration_data_reader=data_reader,
-        quant_format=QuantFormat.QDQ,
+        quant_format=QuantFormat.QOperator,
         op_types_to_quantize=ops_to_include,
         nodes_to_exclude=[
             # buggy blows up export
@@ -218,13 +289,14 @@ def quantize(
             "/text_encoder/cnn.1/cnn.0.2/LeakyRelu",
             "/text_encoder/cnn.2/cnn.0.2/LeakyRelu",
         ],
-        # nodes_to_quantize=to_include,
+        nodes_to_quantize=to_include,
         activation_type=QuantType.QInt8,
         weight_type=QuantType.QInt8,
         calibrate_method=CalibrationMethod.MinMax,
     )
 
-    print("Quantization complete!")
+    model_size = Path(output_path).stat().st_size / (1024 * 1024)  # Convert to MB
+    print(f"Quantization complete! Model size: {model_size:.2f} MB")
 
 
 class CsvCalibrationDataReader(CalibrationDataReader):
@@ -411,7 +483,7 @@ def float16_validate_fn(
     def validate(res1, res2):
         for r1, r2 in zip(res1, res2):
             mse = mel_spectrogram_distance(r1, r2)
-            print("MSE:", mse)
+            print("mel_spectrogram_distance:", mse)
             if mse > mse_threshold:
                 return False
         return True
@@ -419,36 +491,29 @@ def float16_validate_fn(
     return validate
 
 
-@app.command()
-def preprocess(
-    model_path: str = typer.Option(
-        "kokoro.onnx", help="Path to the ONNX model to pre-process"
-    ),
-    output_path: str = typer.Option(
-        "kokoro_preprocessed.onnx", help="Path to save the pre-processed model"
-    ),
-) -> None:
-    """
-    Pre-process an ONNX model for quantization by inserting DQ/Q nodes and running shape inference.
-    Prints a summary of changes made to the model.
+def get_onnx_inputs(
+    voice: str, text: str, vocab: dict[str, int]
+) -> dict[str, np.ndarray]:
+    """Process text into corresponding ONNX inputs."""
 
-    Args:
-        model_path: Path to the input ONNX model
-        output_path: Path to save the pre-processed model
-    """
-    print(f"Loading model from {model_path}")
-    model_original = onnx.load(model_path)
+    lang_code = voice[0]
+    pipeline = KPipeline(lang_code=lang_code, model=False)
 
-    print("Pre-processing model...")
-    quant_pre_process(
-        model_original, output_model_path=output_path, skip_symbolic_shape=True
-    )
-    model = onnx.load(output_path)
+    # Get tokens from pipeline
+    for result in pipeline(text):
+        phoneme_output = result[1]
+        break
 
-    # Compare models to show changes
-    print("\nComparing original and pre-processed models:")
-    diff_models(model_original, model)
+    # Convert phonemes to input_ids
+    tokens = [x for x in map(lambda p: vocab.get(p), phoneme_output) if x is not None]
+    input_ids = torch.LongTensor([[0, *tokens, 0]])
 
-    print(f"\nSaving pre-processed model to {output_path}")
-    onnx.save(model, output_path)
-    print("Pre-processing complete!")
+    # Load and process the style vector
+    ref_s = pipeline.load_voice(voice)
+    ref_s = ref_s[input_ids.shape[1] - 1]
+
+    return {
+        "input_ids": input_ids.numpy(),
+        "style": ref_s.numpy(),
+        "speed": np.array([1.0], dtype=np.float32),
+    }

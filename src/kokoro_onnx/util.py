@@ -71,7 +71,7 @@ def mel_spectrogram_distance(
     hop_length: int = 256,
     n_mels: int = 80,
     window_fn=torch.hann_window,
-    distance_type: str = "L1",
+    distance_type: str = "L2",
 ) -> float:
     """
     Compute a perceptual distance between two audio signals by comparing
