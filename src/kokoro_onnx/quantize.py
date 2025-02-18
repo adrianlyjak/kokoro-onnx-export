@@ -93,6 +93,7 @@ def quantize_neural_compressor(
     quantized_model = quantization.fit(
         model,
         conf=PostTrainingQuantConfig(
+            device="gpu" if torch.cuda.is_available() else "cpu",
             excluded_precisions=["bf16"],
             quant_format="QOperator",
             approach="static",
