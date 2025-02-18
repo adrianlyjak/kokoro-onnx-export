@@ -12,7 +12,7 @@ from kokoro.model import KModel, KModelForONNX
 from kokoro.pipeline import KPipeline
 
 from .cli import app
-from .util import execution_providers, mse_output_score
+from .util import execution_providers, mel_spectrogram_distance
 
 
 @app.command()
@@ -97,8 +97,10 @@ def verify(
         onnx_audio = ort_outputs[0]
 
         # Calculate MSE for audio outputs
-        audio_mse = mse_output_score(torch_audio, onnx_audio)
-        print(f"MSE for audio output: {audio_mse:.5f}")
+        audio_mse = mel_spectrogram_distance(
+            torch_audio, onnx_audio, distance_type="L2"
+        )
+        print(f"loss between PyTorch and ONNX outputs: {audio_mse:.5f}")
 
         # Save audio files
         output_dir = output_dir or "."
@@ -111,5 +113,3 @@ def verify(
         print(
             f"Audio comparison complete. Files written: '{torch_path}', '{onnx_path}'."
         )
-
-        print(f"Mean squared error between PyTorch and ONNX outputs: {audio_mse:.5f}")

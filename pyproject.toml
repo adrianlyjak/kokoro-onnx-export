@@ -19,6 +19,7 @@ dependencies = [
     "rich>=13.9.4",
     "soundfile>=0.13.1",
     "torch>=2.6.0",
+    "torchaudio>=2.6.0",
     "transformers>=4.48.3",
     "typer>=0.15.1",
 ]

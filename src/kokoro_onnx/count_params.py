@@ -1,99 +1,140 @@
 import os
 from collections import defaultdict
+from enum import Enum
+from typing import Dict, Tuple
 
 import numpy as np
 import onnx
 import typer
+from onnx import AttributeProto, TensorProto, numpy_helper
 from rich import print
 
 from .cli import app
 
 
+class CountBy(str, Enum):
+    OP = "op"
+    NAME = "name"
+
+
 @app.command()
-def count_params(
+def count(
     model_path: str = typer.Option("kokoro.onnx", help="Path to the ONNX model file"),
-    depth: int = typer.Option(2, help="Depth of the prefix to count"),
+    count_by: CountBy = typer.Option(
+        CountBy.OP, help="Count by operation type or name prefix"
+    ),
+    name_depth: int = typer.Option(
+        2, help="Depth of the name prefix to count by (when count_by=name)"
+    ),
+    size: bool = typer.Option(
+        False, help="Count parameter sizes instead of number of nodes"
+    ),
 ):
     """
-    Loads an ONNX model and summarizes its parameters by the second-level prefix.
-    E.g.,
-       - kmodel.predictor.F0.0.conv1.weight_v  ->  "kmodel.predictor"
-       - kmodel.bert.encoder.albert_layer_groups.0...  ->  "kmodel.bert"
+    Analyzes an ONNX model, counting nodes or parameters by operation type or name prefix.
     """
-    # Load model
     model = onnx.load(model_path)
 
-    # Get file size in bytes
-    file_size_bytes = os.path.getsize(model_path)
-    file_size_kb = file_size_bytes / (1024)
+    # Show file size when counting parameters
+    if size:
+        file_size_kb = os.path.getsize(model_path) / 1024
+        print(f"ONNX File Size on Disk: {file_size_kb:.2f} KB")
 
-    # Dictionary to accumulate parameter sizes per second-level prefix
-    param_group_sizes = defaultdict(int)
-
-    # Iterate over each initializer (tensor) in the graph
-    for initializer in model.graph.initializer:
-        # Count number of elements in tensor
-        num_params = np.prod(initializer.dims)
-
-        # Here we assume FP32 for size calculation (4 bytes per parameter).
-        # Adjust if your model uses different datatypes (e.g., int8, FP16, BF16, etc.).
-        param_size_bytes = num_params * 4
-
-        # Parse out the prefix up to the second dot
-        # e.g. "kmodel.predictor" from "kmodel.predictor.F0.0.conv1.weight_v"
-        # Split only up to 2 dots to avoid splitting the entire string
-        split_name = initializer.name.split(".", depth)
-
-        if len(split_name) >= depth:
-            prefix = ".".join(split_name[:depth])
+    # Get grouping function based on count_by
+    def get_group(name: str, op_type: str = None) -> str:
+        if count_by == CountBy.OP:
+            return op_type or "Unattached"
         else:
-            # If for some reason there isn't a second segment,
-            # just use the entire name as the group
-            prefix = initializer.name
+            split_name = name.split(".", name_depth)
+            return (
+                ".".join(split_name[:name_depth])
+                if len(split_name) >= name_depth
+                else name
+            )
 
-        # Accumulate total bytes for this prefix
-        param_group_sizes[prefix] += param_size_bytes
+    # Count either nodes or parameters
+    if size:
+        # Map inputs to op types for parameter counting
+        input_to_op = {}
+        for node in model.graph.node:
+            for input_name in node.input:
+                input_to_op[input_name] = node.op_type
 
-    # Print overall file size
-    print(f"ONNX File Size on Disk: {file_size_kb:.2f} KB")
-    print(f"Parameter Group Sizes (by {depth}-level prefix):")
+        # Count parameter sizes and counts
+        sizes: Dict[str, int] = defaultdict(int)
+        counts: Dict[str, int] = defaultdict(int)
 
-    # Sort by descending total parameter size
-    sorted_groups = sorted(param_group_sizes.items(), key=lambda x: x[1], reverse=True)
+        # Count initializers
+        for initializer in model.graph.initializer:
+            num_params = np.prod(initializer.dims)
+            param_size_bytes = num_params * 4  # Assuming FP32
 
-    for group, size_bytes in sorted_groups:
-        print(f"  {group:40s} {size_bytes / (1024):.2f} KB")
-    total_size_kb = sum(size_bytes / (1024) for group, size_bytes in sorted_groups)
-    print(f"Total parameter size: {total_size_kb:.2f} KB")
+            group = get_group(initializer.name, input_to_op.get(initializer.name))
+            sizes[group] += param_size_bytes
+            counts[group] += num_params
 
+        # Count embedded tensors in nodes
+        for node in model.graph.node:
+            group = get_group(node.name, node.op_type)
 
-@app.command()
-def count_node_types(
-    model_path: str = typer.Option("kokoro.onnx", help="Path to the ONNX model file"),
-):
-    """
-    Loads an ONNX model and summarizes its nodes by type.
-    """
-    model = onnx.load(model_path)
+            # Handle Constant nodes which contain embedded tensor data
+            if node.op_type == "Constant":
+                for attr in node.attribute:
+                    if attr.name == "value" and attr.t:
+                        tensor = attr.t
+                        num_params = np.prod(tensor.dims)
+                        param_size_bytes = num_params * 4  # Assuming FP32
+                        sizes[group] += param_size_bytes
+                        counts[group] += num_params
 
-    # Dictionary to count node types
-    node_type_counts = defaultdict(int)
+            # Handle other nodes with tensor attributes
+            for attr in node.attribute:
+                if attr.type == AttributeProto.TENSOR:
+                    tensor = attr.t
+                    num_params = np.prod(tensor.dims)
+                    param_size_bytes = num_params * 4
+                    sizes[group] += param_size_bytes
+                    counts[group] += num_params
+                elif attr.type == AttributeProto.TENSORS:
+                    for tensor in attr.tensors:
+                        num_params = np.prod(tensor.dims)
+                        param_size_bytes = num_params * 4
+                        sizes[group] += param_size_bytes
+                        counts[group] += num_params
 
-    # Count each node type
-    for node in model.graph.node:
-        node_type_counts[node.op_type] += 1
+        # Sort and prepare results
+        sorted_items = sorted(sizes.items(), key=lambda x: x[1], reverse=True)
+        total = sum(size for _, size in sorted_items)
 
-    # Print summary
-    print("Node Types Summary:")
+        # Print results
+        print(
+            f"\nParameter Sizes by {'Operation Type' if count_by == CountBy.OP else f'Name Prefix (depth={name_depth})'}"
+        )
+        for group, size_bytes in sorted_items:
+            size_kb = size_bytes / 1024
+            count = counts[group]
+            percentage = (size_bytes / total) * 100
+            print(
+                f"  {group:40s} {size_kb:8.2f} KB ({percentage:5.1f}%) - {count:,} params"
+            )
+        print(f"\nTotal parameter size: {total / 1024:.2f} KB")
 
-    # Sort by count in descending order
-    sorted_types = sorted(node_type_counts.items(), key=lambda x: x[1], reverse=True)
+    else:
+        # Count nodes
+        counts: Dict[str, int] = defaultdict(int)
+        for node in model.graph.node:
+            group = get_group(node.name, node.op_type)
+            counts[group] += 1
 
-    total_nodes = sum(count for _, count in sorted_types)
+        # Sort and prepare results
+        sorted_items = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        total = sum(count for _, count in sorted_items)
 
-    # Print each type with count and percentage
-    for node_type, count in sorted_types:
-        percentage = (count / total_nodes) * 100
-        print(f"  {node_type:20s} {count:4d} ({percentage:5.1f}%)")
-
-    print(f"\nTotal number of nodes: {total_nodes}")
+        # Print results
+        print(
+            f"Node Counts by {'Operation Type' if count_by == CountBy.OP else f'Name Prefix (depth={name_depth})'}"
+        )
+        for group, count in sorted_items:
+            percentage = (count / total) * 100
+            print(f"  {group:40s} {count:4d} ({percentage:5.1f}%)")
+        print(f"\nTotal number of nodes: {total}")

@@ -86,12 +86,12 @@ def convert_float_to_float16(
         node_block_list = set(node_block_list)
     op_block_list = set(op_block_list)
 
-    # Force shape inference before conversion if not disabled
-    if not disable_shape_infer:
-        try:
-            model = onnx.shape_inference.infer_shapes(model)
-        except Exception as e:
-            warnings.warn(f"Shape inference failed: {str(e)}")
+    # # Force shape inference before conversion if not disabled
+    # if not disable_shape_infer:
+    #     try:
+    #         model = onnx.shape_inference.infer_shapes(model)
+    #     except Exception as e:
+    #         warnings.warn(f"Shape inference failed: {str(e)}")
 
     # Basic checking, optional shape inference
     model, func_infer_shape, is_fp16_ready_flag = initial_checking(

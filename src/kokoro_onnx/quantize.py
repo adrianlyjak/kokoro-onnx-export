@@ -34,7 +34,7 @@ from kokoro_onnx.util import load_vocab
 
 from .cli import app
 from .convert_float_to_float16 import convert_float_to_float16
-from .util import mse_output_score
+from .util import mel_spectrogram_distance
 
 
 def get_onnx_inputs(
@@ -109,7 +109,8 @@ def quantize(
 
     ops_to_include = [
         # "Add",
-        # "Mul",
+        "Mul",
+        "Div",
         # "Slice",
         # "Reshape",
         # "Unsqueeze",
@@ -120,7 +121,7 @@ def quantize(
         # "MatMul",
         # "Shape",
         # "Div",
-        "Conv",
+        # "Conv",
         # "Sqrt",
         # "Concat",
         # "Gemm",
@@ -128,7 +129,7 @@ def quantize(
         # "Sin",
         # "Expand",
         # "LayerNormalization",
-        "LeakyRelu",
+        # "LeakyRelu",
         # "Where",
         # "Cast",
         # "Tanh",
@@ -178,13 +179,13 @@ def quantize(
             | ^/decoder/N_conv/.* # 0.00002 increase in loss, not discernable to my ear
             | ^/decoder/asr_res/.* # no loss
             # lots of them like /decoder/decode.2/conv1/Conv
-            # | ^/decoder/decode\.\d/conv2.* # for all 0.00003 increase in loss, not discernable to my ear. 12 layers, this knocks down 4
+            | ^/decoder/decode\.\d/conv2.* # for all 0.00003 increase in loss, not discernable to my ear. 12 layers, this knocks down 4
             | ^/decoder/decode\..* # the rest
             | ^/N\..* # no loss
-            # | ^/decoder/generator/resblocks\.[0].* # LOTS of params. From 0 to 5, each with 3 convs, so 15 layers. 0.00009 increase in loss if all are included. Certain hollowness to the sound. Limit to middle convolutions doesn't help much, but first layer doesn't seem to hurt
-            | ^/decoder/generator/resblocks\..* # the rest
+            | ^/decoder/generator/resblocks\.[0].* # LOTS of params. From 0 to 5, each with 3 convs, so 15 layers. 0.00009 increase in loss if all are included. Certain hollowness to the sound. Limit to middle convolutions doesn't help much, but first layer doesn't seem to hurt
+            # | ^/decoder/generator/resblocks\..* # the rest
             | ^/decoder/generator/noise_convs\.\d/Conv
-            | ^/decoder/generator/Conv.* # 0.00002 loss, for 2 layers
+            # | ^/decoder/generator/Conv.* # 0.00002 loss, for 2 layers
             # | ^/F0_proj/Conv # ginormous loss
             | ^/N_proj/Conv # 0.00001 loss, for 1 layer
             # | ^/F0\..* # terrible jump in loss. Lots of static
@@ -194,6 +195,7 @@ def quantize(
         )
         """
     )
+    regex = re.compile(r"kmodel\.decoder.*")
     # Count each node type
     for node in model.graph.node:
         if node.op_type in ops_to_include:
@@ -209,17 +211,17 @@ def quantize(
         model_output=output_path,
         calibration_data_reader=data_reader,
         quant_format=QuantFormat.QDQ,
-        op_types_to_quantize=ops_to_include,  # Only quantize convolutions
+        op_types_to_quantize=ops_to_include,
         nodes_to_exclude=[
             # buggy blows up export
             "/text_encoder/cnn.0/cnn.0.2/LeakyRelu",
             "/text_encoder/cnn.1/cnn.0.2/LeakyRelu",
             "/text_encoder/cnn.2/cnn.0.2/LeakyRelu",
         ],
-        nodes_to_quantize=to_include,
-        activation_type=QuantType.QInt16,
-        weight_type=QuantType.QInt16,
-        # calibrate_method=CalibrationMethod.MinMax,
+        # nodes_to_quantize=to_include,
+        activation_type=QuantType.QInt8,
+        weight_type=QuantType.QInt8,
+        calibrate_method=CalibrationMethod.MinMax,
     )
 
     print("Quantization complete!")
@@ -309,12 +311,16 @@ def float16(
 
     # Define ops to convert to float16
     target_ops = {
-        "Conv",
+        # "Conv",
         # "ConvTranspose",
         # "MatMul",
         # "Gemm",
+        # "LayerNormalization",
+        # "Add",  # Often used with residual connections
+        # "Mul",  # Common in attention mechanisms
+        "Div",
+        # "LSTM",
     }
-
     node_block_list = [
         node.name for node in model.graph.node if node.op_type not in target_ops
     ]
@@ -345,7 +351,7 @@ def float16(
     # Compare outputs
     print("\nComparing original and converted model outputs:")
     for i, (orig, conv) in enumerate(zip(original_outputs, fp16_outputs)):
-        mse = mse_output_score(orig, conv)
+        mse = mel_spectrogram_distance(orig, conv)
         print(f"  MSE: {mse}")
 
     print("Conversion complete!")
@@ -404,7 +410,7 @@ def float16_validate_fn(
 ) -> Callable[[np.ndarray, np.ndarray], bool]:
     def validate(res1, res2):
         for r1, r2 in zip(res1, res2):
-            mse = mse_output_score(r1, r2)
+            mse = mel_spectrogram_distance(r1, r2)
             print("MSE:", mse)
             if mse > mse_threshold:
                 return False

@@ -12,7 +12,7 @@ from kokoro.pipeline import KPipeline
 from rich import print
 
 from .cli import app
-from .util import execution_providers, mse_output_score
+from .util import execution_providers, mel_spectrogram_distance
 
 
 @app.command()
@@ -87,7 +87,7 @@ def export(
     # Compare audio output
     torch_audio = output
     onnx_audio = torch.tensor(ort_outputs[0])
-    difference_score = mse_output_score(torch_audio, onnx_audio)
+    difference_score = mel_spectrogram_distance(torch_audio, onnx_audio)
     print(f"Audio difference score: {difference_score:.5f}")
     if torch_audio.shape[-1] != onnx_audio.shape[-1]:
         print(
