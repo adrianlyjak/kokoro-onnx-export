@@ -83,7 +83,7 @@ def verify(
         session = ort.InferenceSession(
             onnx_path,
             session_options,
-            # providers=execution_providers,
+            providers=execution_providers,
         )
         ort_outputs = session.run(None, ort_inputs)
 
