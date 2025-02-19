@@ -1,8 +1,9 @@
 import csv
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Generator, Optional
+from typing import Callable, Generator, Literal, Optional
 
 import numpy as np
 import onnx
@@ -522,3 +523,51 @@ def get_onnx_inputs(
         "style": ref_s.numpy(),
         "speed": np.array([1.0], dtype=np.float32),
     }
+
+
+@dataclass
+class QuantizationSelection:
+    prefix: Optional[str] = None
+    regex: Optional[re.Pattern] = None
+    ops: Optional[list[str]] = None
+    min_params: Optional[int] = None
+
+    def matches(self, node: onnx.NodeProto) -> bool:
+        if self.prefix is not None and not node.name.startswith(self.prefix):
+            return False
+        if self.regex is not None and not self.regex.match(node.name):
+            return False
+        if self.ops is not None and node.op_type not in self.ops:
+            return False
+            # Handle other nodes with tensor attributes
+        params = 0
+        for attr in node.attribute:
+            if attr.type == onnx.AttributeProto.TENSOR:
+                tensor = attr.t
+                params += np.prod(tensor.dims)
+            elif attr.type == onnx.AttributeProto.TENSORS:
+                for tensor in attr.tensors:
+                    params += np.prod(tensor.dims)
+        if self.min_params is not None and params < self.min_params:
+            return False
+        return True
+
+
+@dataclass
+class OpQuantizationRule:
+    op: str
+    min_weights: Literal["int8", "float16", "float32"]
+    min_activations: Literal["int8", "float16", "float32"]
+
+
+QUANT_RULES = [
+    OpQuantizationRule("Conv", "int8", "int8"),
+    OpQuantizationRule("LSTM", "float16", "float16"),
+    OpQuantizationRule("Gemm", "int8", "int8"),
+    OpQuantizationRule("MatMul", "int8", "int8"),
+    OpQuantizationRule("ConvTranspose", "int8", "float16"),
+    OpQuantizationRule("Mul", "int8", "int8"),
+    OpQuantizationRule("LayerNormalization", "float16", "float16"),
+    OpQuantizationRule("Add", "int8", "int8"),
+    OpQuantizationRule("InstanceNormalization", "float16", "float16"),
+]
