@@ -10,11 +10,9 @@ import onnx
 import onnxruntime as ort
 import torch
 import typer
-from huggingface_hub import hf_hub_download
 from kokoro.pipeline import KPipeline
 from neural_compressor import PostTrainingQuantConfig, quantization
 from neural_compressor.config import AccuracyCriterion, TuningCriterion
-from onnxconverter_common.auto_mixed_precision import auto_convert_mixed_precision
 from onnxruntime.quantization import (
     CalibrationMethod,
     QuantFormat,
@@ -89,13 +87,26 @@ def quantize_neural_compressor(
             else ["CPUExecutionProvider"],
         )
         outputs = sess.run(None, inputs)[0]
-        return mel_spectrogram_distance(init_outputs, outputs, distance_type="L2")
+        return 10 - mel_spectrogram_distance(init_outputs, outputs, distance_type="L2")
 
     calibration_dataloader = NeuralCalibrationDataloader(
         calibration_data, num_samples=samples, vocab=vocab
     )
 
-    quantized_model = quantization.fit(
+    ignore = {}
+    selection = QuantizationSelection(
+        ops=[x.op for x in QUANT_RULES],
+        min_params=1536,
+    )
+
+    for node in model.graph.node:
+        if not selection.matches(node):
+            ignore[node.name] = {
+                "weight": {"dtype": "fp32"},
+                "activation": {"dtype": "fp32"},
+            }
+
+    quantization.fit(
         model,
         conf=PostTrainingQuantConfig(
             device="gpu" if torch.cuda.is_available() else "cpu",
@@ -103,19 +114,20 @@ def quantize_neural_compressor(
             quant_format="QOperator",
             approach="static",
             tuning_criterion=TuningCriterion(
-                timeout=0,
+                timeout=60 * 60 * 24,
                 max_trials=trials,
+                objective="modelsize",
             ),
             accuracy_criterion=AccuracyCriterion(
-                higher_is_better=False,
                 criterion="absolute",
-                tolerable_loss=1.3,
+                tolerable_loss=1.0,
             ),
+            op_name_dict=ignore,
+            quant_level=1,
         ),
         calib_dataloader=calibration_dataloader,
         eval_func=eval_func,
     )
-    quantized_model.save(output_path)
 
 
 class NeuralCalibrationDataloader:
