@@ -61,6 +61,7 @@ def convert_float_to_float16(
     op_block_list=None,
     node_block_list=None,
     check_fp16_ready=True,
+    warn_truncate=True,
 ):
     """
     A reworked entry-point to convert an ONNX ModelProto from float32 to float16.
@@ -135,12 +136,14 @@ def convert_float_to_float16(
             used_names,
             min_positive_val,
             max_finite_val,
-            tensor_infos,
+            warn_truncate=warn_truncate,
         )
     for graph in all_graphs:
         for node in graph.node:
             if not checker(node):
-                _modify_node_attribute_type(node, min_positive_val, max_finite_val)
+                _modify_node_attribute_type(
+                    node, min_positive_val, max_finite_val, warn_truncate
+                )
 
     sort_topology(model.graph)
 
@@ -166,7 +169,7 @@ def _modify_graph_for_tensor_info(
     used_node_names: set[str],
     min_positive_val: float,
     max_finite_val: float,
-    hack: list["TensorInfo"] = [],
+    warn_truncate: bool = True,
 ) -> None:
     # Check if type is explicitly set or inferred
     has_explicit_type = (
@@ -193,7 +196,7 @@ def _modify_graph_for_tensor_info(
         if isinstance(ti.proto, TensorProto):
             ti.proto.CopyFrom(
                 convert_tensor_float_to_float16(
-                    ti.proto, min_positive_val, max_finite_val
+                    ti.proto, min_positive_val, max_finite_val, warn_truncate
                 )
             )
         elif has_explicit_type:
@@ -253,20 +256,23 @@ def _modify_node_attribute_type(
     node: NodeProto,
     min_positive_val: float,
     max_finite_val: float,
+    warn_truncate: bool = True,
 ) -> None:
     for attr in node.attribute:
         # Single tensor
         if attr.HasField("t") and attr.t.data_type == onnx_proto.TensorProto.FLOAT:
             attr.t.CopyFrom(
                 convert_tensor_float_to_float16(
-                    attr.t, min_positive_val, max_finite_val
+                    attr.t, min_positive_val, max_finite_val, warn_truncate
                 )
             )
         # List of tensors
         for t in attr.tensors:
             if t.data_type == onnx_proto.TensorProto.FLOAT:
                 t.CopyFrom(
-                    convert_tensor_float_to_float16(t, min_positive_val, max_finite_val)
+                    convert_tensor_float_to_float16(
+                        t, min_positive_val, max_finite_val, warn_truncate
+                    )
                 )
         # Handle dtype attributes for ops that generate tensors
         # Ops that have a dtype attribute that should be converted from float32 to float16
@@ -496,7 +502,9 @@ def _npfloat16_to_int(np_list):
     return [int(bin(_.view("H"))[2:].zfill(16), 2) for _ in np_list]
 
 
-def convert_np_to_float16(np_array, min_positive_val=1e-7, max_finite_val=1e4):
+def convert_np_to_float16(
+    np_array, min_positive_val=1e-7, max_finite_val=1e4, warn: bool = True
+):
     """
     Convert float32 numpy array to float16 without changing sign or finiteness.
     Positive values less than min_positive_val are mapped to min_positive_val.
@@ -511,14 +519,14 @@ def convert_np_to_float16(np_array, min_positive_val=1e-7, max_finite_val=1e4):
         pos_max = np_array[np.where(np_array > 0)].max()
         pos_min = np_array[np.where(np_array > 0)].min()
 
-        if pos_max >= max_finite_val:
+        if pos_max >= max_finite_val and warn:
             warnings.warn(
                 "the float32 number {} will be truncated to {}".format(
                     pos_max, max_finite_val
                 )
             )
 
-        if pos_min <= min_positive_val:
+        if pos_min <= min_positive_val and warn:
             warnings.warn(
                 "the float32 number {} will be truncated to {}".format(
                     pos_min, min_positive_val
@@ -529,14 +537,14 @@ def convert_np_to_float16(np_array, min_positive_val=1e-7, max_finite_val=1e4):
         neg_max = np_array[np.where(np_array < 0)].max()
         neg_min = np_array[np.where(np_array < 0)].min()
 
-        if neg_min <= -max_finite_val:
+        if neg_min <= -max_finite_val and warn:
             warnings.warn(
                 "the float32 number {} will be truncated to {}".format(
                     neg_min, -max_finite_val
                 )
             )
 
-        if neg_max >= -min_positive_val:
+        if neg_max >= -min_positive_val and warn:
             warnings.warn(
                 "the float32 number {} will be truncated to {}".format(
                     neg_max, -min_positive_val
@@ -559,7 +567,10 @@ def convert_np_to_float16(np_array, min_positive_val=1e-7, max_finite_val=1e4):
 
 
 def convert_tensor_float_to_float16(
-    tensor: TensorProto, min_positive_val=1e-7, max_finite_val=1e4
+    tensor: TensorProto,
+    min_positive_val=1e-7,
+    max_finite_val=1e4,
+    warn_truncate: bool = True,
 ):
     """
     Convert tensor float to float16.
@@ -585,7 +596,10 @@ def convert_tensor_float_to_float16(
         # convert float_data (float type) to float16 and write to int32_data
         if tensor.float_data:
             float16_data = convert_np_to_float16(
-                np.array(tensor.float_data), min_positive_val, max_finite_val
+                np.array(tensor.float_data),
+                min_positive_val,
+                max_finite_val,
+                warn_truncate,
             )
             int_list = _npfloat16_to_int(float16_data)
             tensor.int32_data[:] = int_list
@@ -596,7 +610,7 @@ def convert_tensor_float_to_float16(
             float32_list = np.fromstring(tensor.raw_data, dtype="float32")
             # convert float to float16
             float16_list = convert_np_to_float16(
-                float32_list, min_positive_val, max_finite_val
+                float32_list, min_positive_val, max_finite_val, warn_truncate
             )
             # convert float16 to bytes and write back to raw_data
             tensor.raw_data = float16_list.tostring()

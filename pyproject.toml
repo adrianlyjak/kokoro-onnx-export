@@ -14,7 +14,6 @@ dependencies = [
     "neural-compressor>=3.2",
     "onnx>=1.17.0",
     "onnxruntime>=1.20.1",
-    "onnxruntime-gpu>=1.20.1",
     "onnxscript>=0.2.0",
     "pip>=25.0.1",
     "rich>=13.9.4",

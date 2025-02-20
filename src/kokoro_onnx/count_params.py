@@ -23,7 +23,7 @@ class CountBy(str, Enum):
 
 @app.command()
 def count(
-    model_path: str = typer.Option("kokoro.onnx", help="Path to the ONNX model file"),
+    onnx_path: str = typer.Option("kokoro.onnx", help="Path to the ONNX model file"),
     count_by: CountBy = typer.Option(
         CountBy.OP, help="Count by operation type, name prefix, or individual nodes"
     ),
@@ -46,11 +46,11 @@ def count(
     """
     Analyzes an ONNX model, counting nodes or parameters by operation type or name prefix.
     """
-    model = onnx.load(model_path)
+    model = onnx.load(onnx_path)
 
     # Show file size when counting parameters
     if size:
-        file_size_kb = os.path.getsize(model_path) / 1024
+        file_size_kb = os.path.getsize(onnx_path) / 1024
         print(f"ONNX File Size on Disk: {file_size_kb:.2f} KB")
 
     # Get grouping function based on count_by
@@ -221,12 +221,3 @@ def count(
         # Create console with both terminal and markdown output
         console = Console()
         console.print(table)
-
-        # Optionally print as markdown
-        md_console = Console(record=True)
-        md_console.print(table)
-        markdown = md_console.export_text(clear=False)
-        print("\nMarkdown version (copy between the lines):")
-        print("```markdown")
-        print(markdown)
-        print("```")

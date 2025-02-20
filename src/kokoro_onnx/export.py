@@ -9,10 +9,9 @@ import torch
 import typer
 from kokoro.model import KModel, KModelForONNX
 from onnxruntime.quantization import shape_inference
+from onnxruntime.quantization.quant_utils import add_infer_metadata
 from rich import print
 from torch.nn import utils
-
-from kokoro_onnx.quantize import get_onnx_inputs
 
 from .cli import app
 from .util import execution_providers, load_vocab, mel_spectrogram_distance
@@ -96,6 +95,9 @@ def export(
             onnx_model, output_model_path=output_path, skip_symbolic_shape=True
         )
         onnx_model = onnx.load(output_path)
+        onnx_model = onnx.shape_inference.infer_shapes(onnx_model)
+        add_infer_metadata(onnx_model)
+        onnx.save_model(onnx_model, output_path)
 
     # validate the model
     onnx.checker.check_model(onnx_model)
