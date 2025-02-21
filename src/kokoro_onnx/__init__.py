@@ -1,10 +1,10 @@
 from .cli import app
-from .count_params import count_params
-from .export import export
-from .profile_community_onnx import prof_community
-from .verify import verify
+from .cli_count_params import count
+from .cli_export import export
+from .cli_quantize import export_optimized
+from .cli_verify import verify
 
-__all__ = ["count_params", "export", "prof_community", "verify"]
+__all__ = ["count", "export", "verify", "export_optimized"]
 
 
 def main() -> None:
