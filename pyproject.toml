@@ -11,17 +11,13 @@ dependencies = [
     "huggingface-hub>=0.28.1",
     "kokoro",
     "misaki[en,ja,zh]>=0.7.6",
-    "neural-compressor>=3.2",
     "onnx>=1.17.0",
     "onnxruntime>=1.20.1",
-    "onnxscript>=0.2.0",
     "pip>=25.0.1",
     "rich>=13.9.4",
     "soundfile>=0.13.1",
-    "tensorflow>=2.18.0",
     "torch>=2.6.0",
     "torchaudio>=2.6.0",
-    "transformers>=4.48.3",
     "typer>=0.15.1",
 ]
 

@@ -1,283 +1,548 @@
 import csv
-import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Callable, Generator, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 import numpy as np
 import onnx
 import onnxruntime as ort
-import soundfile as sf
-import torch
-import typer
-from neural_compressor import PostTrainingQuantConfig, quantization
-from neural_compressor.config import AccuracyCriterion, TuningCriterion
 from onnxruntime.quantization import (
     CalibrationMethod,
-    QuantFormat,
     QuantType,
-    quantize_static,
 )
-from onnxruntime.quantization.calibrate import CalibrationDataReader
-
-# from rich import print
+from onnxruntime.quantization.calibrate import (
+    CalibrationDataReader,
+    CalibrationMethod,
+    TensorsData,
+    create_calibrator,
+)
+from onnxruntime.quantization.onnx_quantizer import ONNXQuantizer
+from onnxruntime.quantization.quant_utils import (
+    QuantizationMode,
+    QuantType,
+)
 from rich.progress import (
     BarColumn,
     Progress,
+    SpinnerColumn,
     TaskProgressColumn,
     TextColumn,
     TimeRemainingColumn,
 )
 
-from kokoro_onnx.quantize_trial import (
-    QUANT_RULES,
-    DataType,
-    NodeToReduce,
-    QuantizationSelection,
-    estimate_quantized_size,
-    run_float16_trials,
-    run_quantization_trials,
-    select_node_datatypes,
+from kokoro_onnx.convert_float_to_float16 import convert_float_to_float16
+from kokoro_onnx.util import (
+    build_initializer_lookup,
+    count_params_with_initializers,
+    count_params_with_initializers_lookup,
+    get_onnx_inputs,
+    load_vocab,
+    mel_spectrogram_distance,
 )
-from kokoro_onnx.util import load_vocab
-
-from .cli import app
-from .convert_float_to_float16 import convert_float_to_float16
-from .util import get_onnx_inputs, mel_spectrogram_distance
 
 
-@app.command()
-def quantize_neural_compressor(
-    onnx_path: str = typer.Option(
-        "kokoro.onnx", help="Path to the ONNX model to quantize"
-    ),
-    output_path: str = typer.Option(
-        "kokoro_quantized.onnx", help="Path to save the quantized model"
-    ),
-    calibration_data: str = typer.Option(
-        "data/quant-calibration.csv", help="Path to calibration data CSV"
-    ),
-    samples: Optional[int] = typer.Option(
-        None, help="Number of samples to use for calibration"
-    ),
-    trial_path: str = typer.Option(
-        "quantization_trials.csv", help="Path to load trial results from"
-    ),
-    quant_threshold: float = typer.Option(0.25, help="Threshold for trial results"),
-    fp16_threshold: float = typer.Option(0.25, help="Threshold for trial results"),
-    eval_text: str = typer.Option(
-        "Despite its lightweight architecture, it delivers comparable quality to larger models",
-        help="Text to evaluate the model with",
-    ),
-    eval_voice: str = typer.Option("af_heart", help="Voice to evaluate the model with"),
-) -> None:
-    """
-    Quantize an ONNX model using the Neural Compressor library.
+def extract_tensors_range(
+    model: onnx.ModelProto,
+    calibration_data_reader: CalibrationDataReader,
+    op_types_to_quantize=[],
+    calibrate_method=CalibrationMethod.MinMax,
+) -> TensorsData:
+    with tempfile.TemporaryDirectory(prefix="ort.quant.") as quant_tmp_dir:
+        output_path = str(Path(quant_tmp_dir) / "model_input.onnx")
+        onnx.save_model(model, output_path)
 
-    Args:
-        model_path: Path to the input ONNX model
-        output_path: Path to save the quantized model
-    """
-    print("Starting quantization process...")
-
-    model = onnx.load(onnx_path)
-    vocab = load_vocab()
-
-    inputs = get_onnx_inputs(eval_voice, eval_text, vocab)
-
-    init_session = ort.InferenceSession(
-        model.SerializeToString(), providers=["CPUExecutionProvider"]
-    )
-    init_outputs = init_session.run(None, inputs)[0]
-
-    def eval_func(model: onnx.ModelProto):
-        inputs = get_onnx_inputs(eval_voice, eval_text, vocab)
-        sess = ort.InferenceSession(
-            model.SerializeToString(),
-            providers=["CUDAExecutionProvider"]
-            if torch.cuda.is_available()
-            else ["CPUExecutionProvider"],
+        calibrator = create_calibrator(
+            Path(output_path),
+            op_types_to_quantize,
+            augmented_model_path=Path(quant_tmp_dir)
+            .joinpath("augmented_model.onnx")
+            .as_posix(),
+            calibrate_method=calibrate_method,
+            use_external_data_format=False,
+            extra_options={},
         )
-        outputs = sess.run(None, inputs)[0]
-        return 10 - mel_spectrogram_distance(init_outputs, outputs, distance_type="L2")
 
-    calibration_dataloader = NeuralCalibrationDataloader(
-        calibration_data, num_samples=samples, vocab=vocab
-    )
+        calibrator.collect_data(calibration_data_reader)
+        return calibrator.compute_data()
 
-    ops = {}
 
-    specs = select_node_datatypes(
-        quant_threshold=quant_threshold,
-        fp16_threshold=fp16_threshold,
-        trial_csv_path=trial_path,
-    )
-
-    spec_dict = {node.name: node for node in specs}
-
-    def convert_dtype(dtype: DataType) -> str:
-        if dtype == DataType.FLOAT16:
-            return "fp16"
-        elif dtype == DataType.INT8:
-            return "int8"
-        else:
-            return "fp32"
-
+def quantize_model_dynamic(
+    model: onnx.ModelProto,
+    nodes_to_quantize: list[str],
+    weight_type: QuantType = QuantType.QUInt8,
+) -> onnx.ModelProto:
+    types = []
     for node in model.graph.node:
-        spec = spec_dict.get(node.name)
-        if spec:
-            ops[node.name] = {
-                "weight": {"dtype": convert_dtype(spec.weights_type)},
-                "activation": {"dtype": convert_dtype(spec.activations_type)},
-            }
-        else:
-            ops[node.name] = {
-                "weight": {"dtype": "fp32"},
-                "activation": {"dtype": "fp32"},
-            }
+        if node.name in nodes_to_quantize:
+            types.append(node.op_type)
+    types = list(set(types))
 
-    quantization.fit(
+    quantizer = ONNXQuantizer(
         model,
-        conf=PostTrainingQuantConfig(
-            device="gpu" if torch.cuda.is_available() else "cpu",
-            excluded_precisions=["bf16"],
-            quant_format="QDQ",
-            approach="static",
-            tuning_criterion=TuningCriterion(
-                strategy="basic",
-                timeout=0,
-                max_trials=1,
-            ),
-            accuracy_criterion=AccuracyCriterion(
-                criterion="absolute",
-                tolerable_loss=1.0,
-            ),
-            op_name_dict=ops,
-            quant_level=1,
-        ),
-        calib_dataloader=calibration_dataloader,
-        eval_func=eval_func,
+        per_channel=False,
+        reduce_range=False,
+        mode=QuantizationMode.QLinearOps,
+        static=False,  # static
+        weight_qType=weight_type,
+        activation_qType=weight_type,
+        tensors_range=None,
+        nodes_to_quantize=nodes_to_quantize,
+        nodes_to_exclude=[],
+        op_types_to_quantize=types,
+        extra_options=None,
     )
 
-
-class NeuralCalibrationDataloader:
-    def __init__(
-        self,
-        path: str,
-        num_samples: Optional[int] = None,
-        vocab: Optional[dict[str, int]] = None,
-    ):
-        self.vocab = vocab or load_vocab()
-        with open(path, "r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            self.calibration_rows = list(reader)
-        if num_samples is None:
-            self.num_samples = len(self.calibration_rows)
-        else:
-            self.num_samples = num_samples
-        self.batch_size = 1
-
-    def __iter__(self):
-        for row in self.calibration_rows[: self.num_samples]:
-            inputs = get_onnx_inputs(row["Voice"], row["Text"], self.vocab)
-            yield inputs, None
+    quantized = quantizer.quantize_model()
+    return quantized
 
 
-@app.command()
-def quantize(
-    onnx_path: str = typer.Option(
-        "kokoro.onnx", help="Path to the ONNX model to quantize"
-    ),
-    output_path: str = typer.Option(
-        "kokoro_quantized.onnx", help="Path to save the quantized model"
-    ),
-    calibration_data: str = typer.Option(
-        "data/quant-calibration.csv", help="Path to calibration data CSV"
-    ),
-    samples: Optional[int] = typer.Option(
-        None,
-        help="Maximum callibration samples to use. Uses all if not provided.",
-    ),
-) -> None:
-    """
-    Quantize an ONNX model using static quantization with calibration data.
-
-    Args:
-        model_path: Path to the input ONNX model
-        output_path: Path to save the quantized model
-        calibration_data: Path to CSV containing calibration data
-    """
-    print("Starting quantization process...")
-
-    data_reader = CsvCalibrationDataReader(calibration_data, samples)
-
-    print("Starting calibration and quantization...")
-
-    model = onnx.load(onnx_path)
-
-    ops_to_include = ["Conv"]
-    to_include = []
-    ignored = []
-
-    regex = re.compile(
-        r"""(?x) # Enable verbose mode
-        (?:   # Non-capturing group for multiple OR options
-            ^/text_encoder/cnn.*
-            | ^/decoder/generator/noise_res.* # adds 0.00001 loss
-            # misc single convs in decoder
-            | ^/decoder/F0_conv/.* # no loss
-            | ^/decoder/N_conv/.* # 0.00002 increase in loss, not discernable to my ear
-            | ^/decoder/asr_res/.* # no loss
-            # lots of them like /decoder/decode.2/conv1/Conv
-            | ^/decoder/decode\.\d/conv2.* # for all 0.00003 increase in loss, not discernable to my ear. 12 layers, this knocks down 4
-            | ^/decoder/decode\..* # the rest
-            | ^/N\..* # no loss
-            # | ^/decoder/generator/resblocks\.[0].* # LOTS of params. From 0 to 5, each with 3 convs, so 15 layers. 0.00009 increase in loss if all are included. Certain hollowness to the sound. Limit to middle convolutions doesn't help much, but first layer doesn't seem to hurt
-            | ^/decoder/generator/resblocks\..* # the rest
-            | ^/decoder/generator/noise_convs\.\d/Conv
-            | ^/decoder/generator/Conv.* # 0.00002 loss, for 2 layers
-            # | ^/F0_proj/Conv # ginormous loss
-            | ^/N_proj/Conv # 0.00001 loss, for 1 layer
-            # | ^/F0\..* # terrible jump in loss. Lots of static
-            # | ^/decoder/generator/conv_post/Conv # huge loss
-            | ^/decoder/encode/conv2/Conv # 0.00002 loss, for 1 layer
-            | ^/decoder/encode/.* # 0.00004 loss, for 3 layers
-            | ^kmodel\.decoder.* # tons of things
-        )
-        """
-    )
-    # regex = re.compile(r"kmodel\.decoder.*")
-    # Count each node type
+def quantize_model_static(
+    model: onnx.ModelProto,
+    tensors_range: TensorsData,
+    nodes_to_quantize: list[str],
+    weight_type: QuantType = QuantType.QInt8,
+    activation_type: QuantType = QuantType.QInt8,
+) -> onnx.ModelProto:
+    types = []
     for node in model.graph.node:
-        if node.op_type in ops_to_include:
-            if regex.match(node.name):
-                to_include.append(node.name)
-            else:
-                ignored.append(node.name)
+        if node.name in nodes_to_quantize:
+            types.append(node.op_type)
+    types = list(set(types))
 
-    print("including nodes", to_include)
-    print("ignored nodes", ignored)
-    quantize_static(
-        model_input=onnx_path,
-        model_output=output_path,
-        calibration_data_reader=data_reader,
-        quant_format=QuantFormat.QOperator,
-        op_types_to_quantize=ops_to_include,
-        nodes_to_exclude=[
-            # buggy blows up export
-            "/text_encoder/cnn.0/cnn.0.2/LeakyRelu",
-            "/text_encoder/cnn.1/cnn.0.2/LeakyRelu",
-            "/text_encoder/cnn.2/cnn.0.2/LeakyRelu",
-        ],
-        nodes_to_quantize=to_include,
-        activation_type=QuantType.QInt8,
-        weight_type=QuantType.QInt8,
-        calibrate_method=CalibrationMethod.MinMax,
+    quantizer = ONNXQuantizer(
+        model,
+        per_channel=False,
+        reduce_range=False,
+        mode=QuantizationMode.QLinearOps,
+        static=True,  # static
+        weight_qType=weight_type,
+        activation_qType=activation_type,
+        tensors_range=tensors_range,
+        nodes_to_quantize=nodes_to_quantize,
+        nodes_to_exclude=[],
+        op_types_to_quantize=types,
+        extra_options=None,
     )
 
-    model_size = Path(output_path).stat().st_size / (1024 * 1024)  # Convert to MB
-    print(f"Quantization complete! Model size: {model_size:.2f} MB")
+    quantized = quantizer.quantize_model()
+    return quantized
+
+
+def run_quantization_trials(
+    model_path: str,
+    calibration_data_reader: CalibrationDataReader,
+    selections: list["NodeToReduce"],
+    output_file: Path,
+    test_text: str,
+    test_voice: str,
+    static: bool = False,
+):
+    model = onnx.load(model_path)
+
+    initializers = build_initializer_lookup(model.graph)
+
+    # Load existing results to skip completed trials
+    completed_trials = set()
+    if output_file.exists():
+        with open(output_file, "r") as f:
+            # Skip header
+            next(f)
+            for line in f:
+                trial_name = line.split(",")[0]
+                trial_type = line.split(",")[1]
+                if trial_type == "quant":
+                    completed_trials.add(trial_name)
+
+    # Create file with header if it doesn't exist
+    if not output_file.exists():
+        with open(output_file, "w") as f:
+            f.write("name,type,op_type,mel_distance\n")
+
+    vocab = load_vocab()
+    inputs = get_onnx_inputs(test_voice, test_text, vocab)
+
+    init_session = ort.InferenceSession(model.SerializeToString())
+    init_outputs = init_session.run(None, inputs)[0]
+    del init_session
+
+    print("Extracting tensor ranges...")
+    op_types_to_quantize = [
+        rule.op
+        for rule in QUANT_RULES
+        if rule.min_activations == "int8" or rule.min_weights == "int8"
+    ]
+
+    tensors_range = (
+        extract_tensors_range(model, calibration_data_reader, op_types_to_quantize)
+        if static
+        else TensorsData(CalibrationMethod.MinMax, {})
+    )
+
+    # Count remaining trials
+    remaining_trials = [
+        node for node in selections if node.name not in completed_trials
+    ]
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task(
+            "Running quantization trials...", total=len(remaining_trials)
+        )
+
+        for node in remaining_trials:
+            progress.update(task, description=f"Quantizing {node.name}")
+
+            should_quantize = False
+            q_rule = None
+            for rule in QUANT_RULES:
+                if rule.op == node.op_type:
+                    q_rule = rule
+                    break
+            should_quantize = (
+                q_rule.min_activations == "int8" or q_rule.min_weights == "int8"
+            )
+
+            if not should_quantize:
+                with open(output_file, "a") as f:
+                    f.write(
+                        f"{node.name},quant,{node.op_type},{node.params},{node.size},N/A\n"
+                    )
+                progress.advance(task)
+                continue
+
+            nodes_to_quantize = [node.name]
+
+            model = onnx.load(model_path)
+            if static:
+                quantized = quantize_model_static(
+                    model,
+                    tensors_range,
+                    nodes_to_quantize,
+                    weight_type=QuantType.QInt8
+                    if q_rule.min_weights == "int8"
+                    else QuantType.QInt16,
+                )
+            else:
+                quantized = quantize_model_dynamic(
+                    model, nodes_to_quantize, weight_type=QuantType.QUInt8
+                )
+
+            quantized_session = ort.InferenceSession(quantized.SerializeToString())
+            quantized_outputs = quantized_session.run(None, inputs)[0]
+            del quantized_session
+
+            mel_dist = mel_spectrogram_distance(
+                init_outputs, quantized_outputs, distance_type="L2"
+            )
+
+            # Append result to CSV
+            with open(output_file, "a") as f:
+                f.write(
+                    f"{node.name},quant,{node.op_type},{node.params},{node.size},{mel_dist}\n"
+                )
+
+            progress.advance(task)
+
+
+def run_float16_trials(
+    model_path: str,
+    selections: list["NodeToReduce"],
+    output_file: Path,
+    test_text: str,
+    test_voice: str,
+):
+    model = onnx.load(model_path)
+
+    # Load existing results to skip completed trials
+    completed_trials = set()
+    if output_file.exists():
+        with open(output_file, "r") as f:
+            # Skip header
+            next(f)
+            for line in f:
+                trial_name = line.split(",")[0]
+                trial_type = line.split(",")[1]
+                if trial_type == "cast":
+                    completed_trials.add(trial_name)
+
+    # Create file with header if it doesn't exist
+    if not output_file.exists():
+        with open(output_file, "w") as f:
+            f.write("name,type,op_type,params,size,mel_distance\n")
+
+    vocab = load_vocab()
+    inputs = get_onnx_inputs(test_voice, test_text, vocab)
+
+    init_session = ort.InferenceSession(model.SerializeToString())
+    init_outputs = init_session.run(None, inputs)[0]
+    del init_session
+
+    # Count remaining trials
+    remaining_trials = [
+        node for node in selections if node.name not in completed_trials
+    ]
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task(
+            "Running float16 trials...", total=len(remaining_trials)
+        )
+
+        for node in remaining_trials:
+            progress.update(task, description=f"Converting {node.name} to float16")
+
+            should_convert = False
+            for rule in QUANT_RULES:
+                if rule.op == node.op_type:
+                    should_convert = (
+                        rule.min_activations != "float32"
+                        or rule.min_weights != "float32"
+                    )
+                    break
+
+            if not should_convert:
+                with open(output_file, "a") as f:
+                    f.write(
+                        f"{node.name},cast,{node.op_type},{node.params},{node.size},N/A\n"
+                    )
+                progress.advance(task)
+                continue
+
+            model = onnx.load(model_path)
+            node_block_list = [n.name for n in model.graph.node if n.name != node.name]
+            converted = convert_float_to_float16(
+                model,
+                keep_io_types=True,
+                node_block_list=node_block_list,
+                warn_truncate=False,
+            )
+
+            converted_session = ort.InferenceSession(converted.SerializeToString())
+            converted_outputs = converted_session.run(None, inputs)[0]
+            del converted_session
+
+            import soundfile
+
+            soundfile.write("fp16.wav", converted_outputs, samplerate=24000)
+
+            mel_dist = mel_spectrogram_distance(
+                init_outputs, converted_outputs, distance_type="L2"
+            )
+
+            # Append result to CSV
+            with open(output_file, "a") as f:
+                f.write(
+                    f"{node.name},cast,{node.op_type},{node.params},{node.size},{mel_dist}\n"
+                )
+
+            progress.advance(task)
+
+
+@dataclass
+class NodeToReduce:
+    op_type: str
+    name: str
+    params: int
+    size: int
+
+
+@dataclass
+class QuantizationSelection:
+    prefix: Optional[str] = None
+    regex: Optional[re.Pattern] = None
+    ops: Optional[list[str]] = None
+    min_params: Optional[int] = None
+
+    def matches(self, node: onnx.NodeProto, graph: onnx.GraphProto) -> bool:
+        if self.prefix is not None and not node.name.startswith(self.prefix):
+            return False
+        if self.regex is not None and not self.regex.match(node.name):
+            return False
+        if self.ops is not None and node.op_type not in self.ops:
+            return False
+
+        if self.min_params is not None:
+            params, _ = count_params_with_initializers(node, graph)
+            if params < self.min_params:
+                return False
+        return True
+
+
+@dataclass
+class OpQuantizationRule:
+    op: str
+    q_operator: bool
+    min_weights: Literal["int8", "float16", "float32"]
+    min_activations: Literal["int8", "float16", "float32"]
+
+
+QUANT_RULES = [
+    OpQuantizationRule("Conv", True, "int8", "int8"),
+    OpQuantizationRule("LSTM", False, "int8", "int8"),
+    OpQuantizationRule("Gemm", True, "int8", "int8"),
+    OpQuantizationRule("MatMul", True, "int8", "int8"),
+    OpQuantizationRule("ConvTranspose", False, "float16", "float16"),
+    OpQuantizationRule("Mul", False, "int8", "int8"),
+    OpQuantizationRule("LayerNormalization", False, "int8", "int8"),
+    OpQuantizationRule("Add", True, "int8", "int8"),
+    OpQuantizationRule("InstanceNormalization", False, "int8", "int8"),
+]
+
+
+class DataType(Enum):
+    FLOAT32 = "float32"
+    FLOAT16 = "float16"
+    INT8 = "int8"
+
+
+@dataclass
+class NodeQuantSpec:
+    name: str
+    op_type: str
+    weights_type: DataType
+    activations_type: DataType
+    q_operator: bool
+
+    def supports_quantization(self) -> bool:
+        return (
+            self.weights_type == DataType.INT8 or self.activations_type == DataType.INT8
+        )
+
+    def supports_float16(self) -> bool:
+        return (
+            (
+                self.weights_type == DataType.FLOAT16
+                or self.activations_type == DataType.FLOAT16
+            )
+            or self.supports_quantization()
+        )  # fallback to float16 if otherwise excluded from quantization
+
+
+def select_node_datatypes(
+    quant_threshold: float, fp16_threshold: float, trial_csv_path: str
+) -> List[NodeQuantSpec]:
+    # Create mapping of rules by op type for easy lookup
+    rules_by_op = {rule.op: rule for rule in QUANT_RULES}
+
+    # Read trial results
+    results: Dict[str, Dict[str, float]] = {}
+    if not os.path.exists(trial_csv_path):
+        return []
+    with open(trial_csv_path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name = row["name"]
+            trial_type = row["type"]
+            mel_dist = row["mel_distance"]
+            if mel_dist == "N/A":
+                continue
+
+            if name not in results:
+                results[name] = {}
+            results[name][trial_type] = float(mel_dist)
+
+    specs: List[NodeQuantSpec] = []
+
+    for name, trials in results.items():
+        # Get the op_type from any row with matching name
+        with open(trial_csv_path, "r") as f:
+            reader = csv.DictReader(f)
+            op_type = next(row["op_type"] for row in reader if row["name"] == name)
+
+        rule = rules_by_op.get(op_type)
+        if not rule:
+            continue
+
+        # Default to FP32
+        weights_type = DataType.FLOAT32
+        activations_type = DataType.FLOAT32
+
+        # Check quantization results if available
+        if "quant" in trials and trials["quant"] < quant_threshold:
+            # Respect minimum levels from rules
+            if rule.min_weights == "int8":
+                weights_type = DataType.INT8
+            elif rule.min_weights == "float16":
+                weights_type = DataType.FLOAT16
+
+            if rule.min_activations == "int8":
+                activations_type = DataType.INT8
+            elif rule.min_activations == "float16":
+                activations_type = DataType.FLOAT16
+
+        # Check FP16 results if still at FP32
+        elif "cast" in trials and trials["cast"] < fp16_threshold:
+            if weights_type == DataType.FLOAT32 and rule.min_weights != "float32":
+                weights_type = DataType.FLOAT16
+            if (
+                activations_type == DataType.FLOAT32
+                and rule.min_activations != "float32"
+            ):
+                activations_type = DataType.FLOAT16
+
+        specs.append(
+            NodeQuantSpec(
+                name=name,
+                op_type=op_type,
+                weights_type=weights_type,
+                activations_type=activations_type,
+                q_operator=rule.q_operator,
+            )
+        )
+
+    return specs
+
+
+def estimate_quantized_size(
+    model: onnx.ModelProto, quant_specs: List[NodeQuantSpec]
+) -> int:
+    """
+    Estimates the model size in bytes after quantization/casting according to specs
+    """
+    specs_by_name = {spec.name: spec for spec in quant_specs}
+    total_size = 0
+
+    # Helper to calculate size for a data type
+    def get_bytes_per_element(dtype: DataType) -> int:
+        if dtype == DataType.FLOAT16:
+            return 2
+        elif dtype == DataType.INT8:
+            return 1
+        return 4
+
+    # Process initializers (weights)
+    for initializer in model.graph.initializer:
+        # Find which node this initializer belongs to
+        connected_node = None
+        for node in model.graph.node:
+            if initializer.name in node.input:
+                connected_node = node
+                break
+
+        if connected_node and connected_node.name in specs_by_name:
+            spec = specs_by_name[connected_node.name]
+            bytes_per_element = get_bytes_per_element(spec.weights_type)
+        else:
+            bytes_per_element = 4  # Default to float32
+
+        size = np.prod(initializer.dims) * bytes_per_element
+        total_size += size
+
+    return total_size
 
 
 class CsvCalibrationDataReader(CalibrationDataReader):
@@ -297,17 +562,19 @@ class CsvCalibrationDataReader(CalibrationDataReader):
             calibration_rows = calibration_rows[:samples]
         self.rows = calibration_rows
         self.enum_data = iter(calibration_rows)
-        self.progress = Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeRemainingColumn(),
-            auto_refresh=False,
-        )
-        self.task = self.progress.add_task("Calibrating", total=len(calibration_rows))
-        self.progress.start()
+        self.progress = None
 
     def get_next(self):
+        if self.progress is None:
+            self.progress = Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeRemainingColumn(),
+                auto_refresh=False,
+            )
+            self.task = self.progress.add_task("Calibrating", total=len(self.rows))
+            self.progress.start()
         try:
             row = next(self.enum_data)
             # Extract language code from first character of voice name
@@ -324,429 +591,5 @@ class CsvCalibrationDataReader(CalibrationDataReader):
 
     def rewind(self):
         self.enum_data = iter(self.rows)
-        self.progress.reset(self.task)
-
-
-@app.command()
-def float16(
-    onnx_path: str = typer.Option(
-        "kokoro.onnx", help="Path to the ONNX model to convert"
-    ),
-    output_path: str = typer.Option(
-        "kokoro_fp16.onnx", help="Path to save the FP16 model"
-    ),
-    sample_text: str = typer.Option(
-        "Despite its lightweight architecture, it delivers comparable quality to larger models",
-        help="Text to sample the model with for auto callibration",
-    ),
-    sample_voice: str = typer.Option(
-        "af_heart", help="Voice to sample the model with for auto callibration"
-    ),
-) -> None:
-    """Convert specific parts of model to float16."""
-
-    print(f"Loading model from {onnx_path}")
-    model = onnx.load(onnx_path)
-
-    # Add debug output before conversion
-    print("\nAnalyzing original model:")
-
-    # Generate test inputs
-    print("Generating test inputs...")
-    vocab = load_vocab()
-    inputs = get_onnx_inputs(sample_voice, sample_text, vocab)
-
-    # Test original model
-    print("\nTesting original model...")
-    sess = ort.InferenceSession(
-        model.SerializeToString(), providers=["CPUExecutionProvider"]
-    )
-    original_outputs = sess.run(None, inputs)
-
-    # Compare model with itself as sanity check
-    print("\nSanity check - comparing original model with itself:")
-    for i, out in enumerate(original_outputs):
-        print(f"Output {i}: shape={out.shape}, dtype={out.dtype}")
-        if np.isnan(out).any():
-            print(f"WARNING: Output {i} contains NaN values!")
-
-    # Define ops to convert to float16
-    target_ops = {
-        # "Conv",
-        # "ConvTranspose",
-        # "MatMul",
-        # "Gemm",
-        # "LayerNormalization",
-        # "Add",  # Often used with residual connections
-        # "Mul",  # Common in attention mechanisms
-        "Div",
-        # "LSTM",
-    }
-    node_block_list = [
-        node.name for node in model.graph.node if node.op_type not in target_ops
-    ]
-    # Convert model to float16, targeting specific ops
-    model_fp16 = convert_float_to_float16(
-        model,
-        keep_io_types=True,
-        node_block_list=node_block_list,
-    )
-    print(f"\nSaving model to {output_path}...")
-    onnx.save(model_fp16, output_path)
-
-    # Test converted model
-    print("\nTesting converted model...")
-    try:
-        sess_fp16 = ort.InferenceSession(
-            output_path, providers=["CPUExecutionProvider"]
-        )
-        fp16_outputs = sess_fp16.run(None, inputs)
-    except Exception as e:
-        print(f"Error testing converted model: {e}")
-        raise
-
-    # Replace node type counting with model diffing
-    print("\nComparing original and converted models:")
-    diff_models(model, model_fp16)
-
-    # Compare outputs
-    print("\nComparing original and converted model outputs:")
-    for i, (orig, conv) in enumerate(zip(original_outputs, fp16_outputs)):
-        mse = mel_spectrogram_distance(orig, conv)
-        print(f"  MSE: {mse}")
-
-    print("Conversion complete!")
-
-    # Add debug output after conversion
-    print("\nAnalyzing converted model:")
-
-
-def diff_models(model1, model2):
-    """Compare two ONNX models and print their differences."""
-    print("\nModel differences:")
-
-    # Get nodes from both models
-    nodes1 = {n.name: n for n in model1.graph.node}
-    nodes2 = {n.name: n for n in model2.graph.node}
-
-    # Find added and removed nodes
-    added_nodes = set(nodes2.keys()) - set(nodes1.keys())
-    removed_nodes = set(nodes1.keys()) - set(nodes2.keys())
-
-    # Count operation types for added nodes
-    added_ops = {}
-    for name in added_nodes:
-        op_type = nodes2[name].op_type
-        added_ops[op_type] = added_ops.get(op_type, 0) + 1
-
-    # Count operation types for removed nodes
-    removed_ops = {}
-    for name in removed_nodes:
-        op_type = nodes1[name].op_type
-        removed_ops[op_type] = removed_ops.get(op_type, 0) + 1
-
-    # Print summary
-    if added_ops:
-        print("\nAdded operations:")
-        for op_type, count in sorted(added_ops.items()):
-            print(f"  {op_type}: {count} nodes")
-
-    if removed_ops:
-        print("\nRemoved operations:")
-        for op_type, count in sorted(removed_ops.items()):
-            print(f"  {op_type}: {count} nodes")
-
-    if not (added_ops or removed_ops):
-        print("  No structural changes detected")
-
-    # Compare total node counts
-    print(f"\nTotal nodes:")
-    print(f"  Original: {len(nodes1)}")
-    print(f"  Modified: {len(nodes2)}")
-    print(f"  Difference: {len(nodes2) - len(nodes1):+d}")
-
-
-def float16_validate_fn(
-    mse_threshold: float = 0.0001,
-) -> Callable[[np.ndarray, np.ndarray], bool]:
-    def validate(res1, res2):
-        for r1, r2 in zip(res1, res2):
-            mse = mel_spectrogram_distance(r1, r2)
-            print("mel_spectrogram_distance:", mse)
-            if mse > mse_threshold:
-                return False
-        return True
-
-    return validate
-
-
-@app.command()
-def run_trials(
-    onnx_path: str = typer.Option(
-        "kokoro.onnx", help="Path to the ONNX model to quantize"
-    ),
-    output_path: str = typer.Option(
-        "quantization_trials.csv", help="Path to save trial results"
-    ),
-    calibration_data: str = typer.Option(
-        "data/quant-calibration.csv", help="Path to calibration data CSV"
-    ),
-    samples: Optional[int] = typer.Option(
-        None,
-        help="Maximum calibration samples to use. Uses all if not provided.",
-    ),
-    eval_text: str = typer.Option(
-        "Despite its lightweight architecture, it delivers comparable quality to larger models",
-        help="Text to evaluate the model with",
-    ),
-    eval_voice: str = typer.Option("af_heart", help="Voice to evaluate the model with"),
-) -> None:
-    """
-    Run quantization trials on individual nodes to measure their impact on model quality.
-    Results are saved to a CSV file with columns: name, op_type, mel_distance
-    """
-    print("Loading model...")
-    model = onnx.load(onnx_path)
-
-    # Create list of nodes to try quantizing
-    selection = QuantizationSelection(
-        ops=[
-            x.op
-            for x in QUANT_RULES
-            if x.min_activations == "int8" or x.min_weights == "int8"
-        ],
-        min_params=512,
-    )
-    nodes_to_reduce = [
-        NodeToReduce(op_type=node.op_type, name=node.name)
-        for node in model.graph.node
-        if selection.matches(node, model.graph)
-    ]
-
-    print(f"Found {len(nodes_to_reduce)} nodes to evaluate")
-
-    print("Running float16 trials...")
-    run_float16_trials(
-        model_path=onnx_path,
-        selections=nodes_to_reduce,
-        output_file=Path(output_path),
-        test_text=eval_text,
-        test_voice=eval_voice,
-    )
-    print("Running quantization trials...")
-    data_reader = CsvCalibrationDataReader(calibration_data, samples)
-    run_quantization_trials(
-        model_path=onnx_path,
-        calibration_data_reader=data_reader,
-        selections=nodes_to_reduce,
-        output_file=Path(output_path),
-        test_text=eval_text,
-        test_voice=eval_voice,
-    )
-
-    print(f"Trials complete! Results saved to {output_path}")
-
-
-@app.command()
-def estimate_size(
-    onnx_path: str = typer.Option(
-        "kokoro.onnx", help="Path to the ONNX model to analyze"
-    ),
-    trial_results: str = typer.Option(
-        "quantization_trials.csv", help="Path to trial results CSV"
-    ),
-    quant_threshold: float = typer.Option(
-        0.25, help="Maximum acceptable mel distance for quantization"
-    ),
-    fp16_threshold: float = typer.Option(
-        0.25, help="Maximum acceptable mel distance for fp16 conversion"
-    ),
-) -> None:
-    """
-    Estimate model size after quantization/casting based on trial results and thresholds.
-    """
-    print("Loading model...")
-    model = onnx.load(onnx_path)
-
-    original_size = Path(onnx_path).stat().st_size / (1024 * 1024)  # Convert to MB
-    print(f"Original model size: {original_size:.2f} MB")
-
-    print(f"\nAnalyzing with thresholds:")
-    print(f"  Quantization: {quant_threshold}")
-    print(f"  FP16 casting: {fp16_threshold}")
-
-    # Get quantization specifications based on thresholds
-    specs = select_node_datatypes(
-        quant_threshold=quant_threshold,
-        fp16_threshold=fp16_threshold,
-        trial_csv_path=trial_results,
-    )
-
-    # Count nodes by data type
-    quant_counts = {
-        "weights": {"float32": 0, "float16": 0, "int8": 0},
-        "activations": {"float32": 0, "float16": 0, "int8": 0},
-    }
-
-    for spec in specs:
-        quant_counts["weights"][spec.weights_type.value] += 1
-        quant_counts["activations"][spec.activations_type.value] += 1
-
-    print("\nNode data type distribution:")
-    print("Weights:")
-    for dtype, count in quant_counts["weights"].items():
-        print(f"  {dtype}: {count}")
-    print("Activations:")
-    for dtype, count in quant_counts["activations"].items():
-        print(f"  {dtype}: {count}")
-
-    # Estimate size
-    estimated_size = estimate_quantized_size(model, specs)
-    estimated_mb = estimated_size / (1024 * 1024)  # Convert to MB
-
-    print(f"\nEstimated model size: {estimated_mb:.2f} MB")
-    print(f"Estimated reduction: {(1 - estimated_mb / original_size) * 100:.1f}%")
-
-
-@app.command()
-def export_optimized(
-    onnx_path: str = typer.Option(
-        "kokoro.onnx", help="Path to the ONNX model to optimize"
-    ),
-    output_path: str = typer.Option(
-        "kokoro_optimized.onnx", help="Path to save the optimized model"
-    ),
-    trial_results: str = typer.Option(
-        "quantization_trials.csv", help="Path to trial results CSV"
-    ),
-    quant_threshold: float = typer.Option(
-        0.25, help="Maximum acceptable mel distance for quantization"
-    ),
-    fp16_threshold: float = typer.Option(
-        0.25, help="Maximum acceptable mel distance for fp16 conversion"
-    ),
-    samples: Optional[int] = typer.Option(
-        None, help="Number of samples to use for calibration"
-    ),
-    eval_text: str = typer.Option(
-        "Despite its lightweight architecture, it delivers comparable quality to larger models",
-        help="Text to evaluate the model with",
-    ),
-    eval_voice: str = typer.Option("af_heart", help="Voice to evaluate the model with"),
-) -> None:
-    """
-    Export an optimized model using both FP16 and INT8 quantization based on trial results.
-    """
-    print("Loading model...")
-    model = onnx.load(onnx_path)
-    original_model = onnx.load(onnx_path)
-    original_size = Path(onnx_path).stat().st_size / (1024 * 1024)
-    print(f"Original model size: {original_size:.2f} MB")
-
-    # Get test inputs and original outputs for comparison
-    vocab = load_vocab()
-    inputs = get_onnx_inputs(eval_voice, eval_text, vocab)
-    sess = ort.InferenceSession(
-        model.SerializeToString(), providers=["CPUExecutionProvider"]
-    )
-    original_outputs = sess.run(None, inputs)
-
-    # Get node specifications based on thresholds
-    specs = select_node_datatypes(
-        quant_threshold=quant_threshold,
-        fp16_threshold=fp16_threshold,
-        trial_csv_path=trial_results,
-    )
-
-    # Separate nodes based on quantization support
-    qdq_nodes = []
-    qop_nodes = []
-    fp16_nodes = []
-
-    for spec in specs:
-        if spec.weights_type == DataType.INT8 or spec.activations_type == DataType.INT8:
-            if spec.q_operator:  # Use the q_operator flag from the rules
-                qop_nodes.append(spec.name)
-            else:
-                qdq_nodes.append(spec.name)
-        elif (
-            spec.weights_type == DataType.FLOAT16
-            or spec.activations_type == DataType.FLOAT16
-        ):
-            fp16_nodes.append(spec.name)
-
-    print(f"\nOptimizing model:")
-    print(f"FP16 nodes: {len(fp16_nodes)}")
-    print(f"QOperator nodes: {len(qop_nodes)}")
-    print(f"QDQ nodes: {len(qdq_nodes)}")
-
-    # First convert applicable nodes to FP16
-    if fp16_nodes:
-        print("\nConverting nodes to FP16...")
-        node_block_list = [
-            node.name for node in model.graph.node if node.name not in fp16_nodes
-        ]
-        model = convert_float_to_float16(
-            model,
-            keep_io_types=True,
-            node_block_list=node_block_list,
-        )
-
-    # Then quantize nodes that support QOperator format
-    if qop_nodes:
-        print("\nQuantizing QOperator-compatible nodes...")
-        temp_path = output_path + ".temp"
-        onnx.save(model, temp_path)
-
-        data_reader = CsvCalibrationDataReader("data/quant-calibration.csv", samples)
-        quantize_static(
-            model_input=temp_path,
-            model_output=temp_path,  # Save to temp for next step
-            calibration_data_reader=data_reader,
-            quant_format=QuantFormat.QOperator,
-            nodes_to_quantize=qop_nodes,
-            activation_type=QuantType.QInt8,
-            weight_type=QuantType.QInt8,
-            calibrate_method=CalibrationMethod.MinMax,
-        )
-        model = onnx.load(temp_path)
-
-    # Finally quantize nodes that only support QDQ
-    if qdq_nodes:
-        print("\nQuantizing QDQ-only nodes...")
-        temp_path = output_path + ".temp"
-        onnx.save(model, temp_path)
-
-        data_reader = CsvCalibrationDataReader("data/quant-calibration.csv", samples)
-        quantize_static(
-            model_input=temp_path,
-            model_output=output_path,
-            calibration_data_reader=data_reader,
-            quant_format=QuantFormat.QDQ,
-            nodes_to_quantize=qdq_nodes,
-            activation_type=QuantType.QInt8,
-            weight_type=QuantType.QInt8,
-            calibrate_method=CalibrationMethod.MinMax,
-        )
-        Path(temp_path).unlink()  # Clean up temp file
-    else:
-        # If no QDQ nodes, just save the current model
-        onnx.save(model, output_path)
-
-    diff_models(original_model, model)
-    # Calculate final size and quality metrics
-    final_size = Path(output_path).stat().st_size / (1024 * 1024)
-    print(f"\nFinal model size: {final_size:.2f} MB")
-    print(f"Size reduction: {(1 - final_size / original_size) * 100:.1f}%")
-
-    # Test optimized model
-    print("\nTesting optimized model...")
-    optimized_sess = ort.InferenceSession(
-        output_path, providers=["CPUExecutionProvider"]
-    )
-    optimized_outputs = optimized_sess.run(None, inputs)
-
-    # Compare outputs
-    mse = mel_spectrogram_distance(original_outputs[0], optimized_outputs[0])
-    sf.write("onnx_optimized.wav", optimized_outputs[0], 24000)
-    print(f"Mel spectrogram distance from original: {mse}")
+        if self.progress is not None:
+            self.progress.reset(self.task)

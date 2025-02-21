@@ -2,10 +2,12 @@ import json
 from typing import Union
 
 import numpy as np
+import onnx
 import torch
 import torchaudio
 from huggingface_hub import hf_hub_download
 from kokoro.pipeline import KPipeline
+from onnx import TensorProto
 
 execution_providers = [
     "CUDAExecutionProvider",
@@ -163,3 +165,98 @@ def get_onnx_inputs(
         "style": ref_s.numpy(),
         "speed": np.array([1.0], dtype=np.float32),
     }
+
+
+def count_embedded_tensor_params(node: onnx.NodeProto) -> tuple[int, int]:
+    """Count the number of parameters and estimated size in bits"""
+    # Handle Constant nodes which contain embedded tensor data
+    params = 0
+    size = 0
+    if node.op_type == "Constant":
+        for attr in node.attribute:
+            if attr.name == "value" and attr.t:
+                tensor = attr.t
+                num_params = np.prod(tensor.dims)
+                params += num_params
+                size += num_params * (TENSOR_TYPE_TO_SIZE.get(tensor.data_type, 4))
+
+    for attr in node.attribute:
+        if attr.type == onnx.AttributeProto.TENSOR:
+            tensor = attr.t
+            cnt = np.prod(tensor.dims)
+            params += cnt
+            size += cnt * (TENSOR_TYPE_TO_SIZE.get(tensor.data_type, 4))
+        elif attr.type == onnx.AttributeProto.TENSORS:
+            for tensor in attr.tensors:
+                cnt = np.prod(tensor.dims)
+                params += cnt
+                size += cnt * (TENSOR_TYPE_TO_SIZE.get(tensor.data_type, 4))
+
+    return params, size
+
+
+def count_params_with_initializers(
+    node: onnx.NodeProto, graph: onnx.GraphProto
+) -> tuple[int, int]:
+    """Count the number of parameters and estimated size in bits"""
+    # Count parameters from node attributes
+    initializers = build_initializer_lookup(graph)
+    return count_params_with_initializers_lookup(node, initializers)
+
+
+def build_initializer_lookup(graph: onnx.GraphProto) -> dict[str, TensorProto]:
+    return {initializer.name: initializer for initializer in graph.initializer}
+
+
+def count_params_with_initializers_lookup(
+    node: onnx.NodeProto, initializers: dict[str, TensorProto]
+) -> tuple[int, int]:
+    """Count the number of parameters and estimated size in bits"""
+
+    # Handle Constant nodes which contain embedded tensor data
+    params, size = count_embedded_tensor_params(node)
+    # Count parameters from initializers connected to this node's inputs
+    for input_name in node.input:
+        initializer = initializers.get(input_name)
+        if initializer:
+            cnt = np.prod(initializer.dims)
+            params += cnt
+            size += cnt * (TENSOR_TYPE_TO_SIZE.get(initializer.data_type, 4))
+
+    return params, size
+
+
+# Move type mapping to module level
+TENSOR_TYPE_TO_NAME = {
+    TensorProto.FLOAT: "FP32",
+    TensorProto.FLOAT16: "FP16",
+    TensorProto.BFLOAT16: "BFLOAT16",
+    TensorProto.DOUBLE: "FP64",
+    TensorProto.INT8: "INT8",
+    TensorProto.UINT8: "UINT8",
+    TensorProto.INT16: "INT16",
+    TensorProto.UINT16: "UINT16",
+    TensorProto.INT32: "INT32",
+    TensorProto.UINT32: "UINT32",
+    TensorProto.INT64: "INT64",
+    TensorProto.UINT64: "UINT64",
+    TensorProto.BOOL: "BOOL",
+}
+
+TENSOR_NAME_TO_TYPE = {name: dtype for dtype, name in TENSOR_TYPE_TO_NAME.items()}
+
+TENSOR_TYPE_TO_SIZE = {
+    TensorProto.FLOAT: 4,  # FP32
+    TensorProto.FLOAT16: 2,  # FP16
+    TensorProto.BFLOAT16: 2,  # BFLOAT16
+    TensorProto.DOUBLE: 8,  # FP64
+    TensorProto.INT8: 1,  # INT8
+    TensorProto.UINT8: 1,  # UINT8
+    TensorProto.INT16: 2,  # INT16
+    TensorProto.UINT16: 2,  # UINT16
+    TensorProto.INT32: 4,  # INT32
+    TensorProto.UINT32: 4,  # UINT32
+    TensorProto.INT64: 8,  # INT64
+    TensorProto.UINT64: 8,  # UINT64
+    TensorProto.BOOL: 1,  # BOOL
+}

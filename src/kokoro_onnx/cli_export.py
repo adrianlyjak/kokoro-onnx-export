@@ -1,10 +1,6 @@
-import time
 from pathlib import Path
 
-import numpy as np
 import onnx
-import onnxruntime as ort
-import onnxscript
 import torch
 import typer
 from kokoro.model import KModel, KModelForONNX
@@ -14,8 +10,7 @@ from rich import print
 from torch.nn import utils
 
 from .cli import app
-from .util import execution_providers, load_vocab, mel_spectrogram_distance
-from .verify import verify
+from .cli_verify import verify
 
 
 @app.command()

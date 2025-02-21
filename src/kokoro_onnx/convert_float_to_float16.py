@@ -1,4 +1,7 @@
 # Copied and heavily modified from https://github.com/microsoft/onnxconverter-common/blob/master/onnxconverter_common/float16.py
+# - That implementation modifies all tensors, and places casting around them, with the intent that this would be optimized away. This one does not.
+# - That implementation does not correctly navigate child graphs, which can cause the wrong format tensors to be fed into the child graphs.
+
 import itertools
 import warnings
 from collections import defaultdict

@@ -58,7 +58,7 @@ def verify(
     _, tokens = pipeline.g2p(text)
 
     # Process the first token sequence (for simplicity)
-    graphemes, phonemes, token_list = next(pipeline.en_tokenize(tokens))
+    _, phonemes, _ = next(pipeline.en_tokenize(tokens))
 
     with torch.no_grad():
         # Convert phonemes to input_ids
