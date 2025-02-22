@@ -197,11 +197,24 @@ def export_optimized(
     quant_static: bool = typer.Option(False, help="Whether to use static quantization"),
     quant_exclude: Optional[str] = typer.Option(None, help="regex of nodes to exclude"),
     eval_voice: str = typer.Option("af_heart", help="Voice to evaluate the model with"),
+    quant_type: str = typer.Option("QInt8", help="Quantization type to use"),
+    quant_activation_type: Optional[str] = typer.Option(
+        None, help="Quantization type to use for activations"
+    ),
+    quant_op_types: Optional[list[str]] = typer.Option(
+        None, help="List of operation types to quantize"
+    ),
 ) -> None:
     """
     Export an optimized model using both FP16 and INT8 quantization based on trial results.
     """
     print("Loading model...")
+    quant_type_enum = QuantType.from_string(quant_type)
+    quant_activation_type_enum = (
+        QuantType.from_string(quant_activation_type)
+        if quant_activation_type
+        else quant_type_enum
+    )
     model = onnx.load(onnx_path)
     original_model = onnx.load(onnx_path)
     original_size = Path(onnx_path).stat().st_size / (1024 * 1024)
@@ -220,6 +233,7 @@ def export_optimized(
         quant_threshold=quant_threshold,
         fp16_threshold=fp16_threshold,
         trial_csv_path=trial_results,
+        quantizable_ops=quant_op_types,
     )
     if not specs:
         print(
@@ -229,6 +243,7 @@ def export_optimized(
 
     # Separate nodes based on quantization support
     q_nodes = []
+    q_node_types: dict[str, str] = {}
     fp16_nodes = []
 
     quant_exclude_r = re.compile(quant_exclude) if quant_exclude else None
@@ -242,11 +257,13 @@ def export_optimized(
             quantize = False
         if quantize:
             q_nodes.append(spec.name)
+            q_node_types[spec.name] = spec.op_type
             if (
                 spec.op_type == "Gemm"
             ):  # for some reason these nodes get munged up before they can get targeted
                 q_nodes.append(spec.name + "_MatMul")
-        elif float16:
+                q_node_types[spec.name + "_MatMul"] = "MatMul"
+        elif float16 and fp16_threshold > 0:
             fp16_nodes.append(spec.name)
 
     print(f"\nOptimizing model:")
@@ -282,16 +299,30 @@ def export_optimized(
                 calibration_data_reader=data_reader,
                 quant_format=QuantFormat.QOperator,
                 nodes_to_quantize=q_nodes,
-                activation_type=QuantType.QUInt8,
-                weight_type=QuantType.QUInt8,
+                activation_type=quant_activation_type_enum,
+                weight_type=quant_type_enum,
                 calibrate_method=CalibrationMethod.MinMax,
             )
         else:
+            if quant_type_enum == QuantType.QInt8:
+                print(
+                    "pre-Quantizing conv layers only to uint8, as they are not compatible with int8"
+                )
+                quantize_dynamic(
+                    model_input=temp_path,
+                    model_output=temp_path,
+                    nodes_to_quantize=[q for q in q_nodes if q_node_types[q] == "Conv"],
+                    weight_type=QuantType.QUInt8,
+                )
             quantize_dynamic(
                 model_input=temp_path,
                 model_output=temp_path,
-                nodes_to_quantize=q_nodes,
-                weight_type=QuantType.QUInt8,
+                nodes_to_quantize=[
+                    q
+                    for q in q_nodes
+                    if q_node_types[q] != "Conv" or quant_type_enum != QuantType.QInt8
+                ],
+                weight_type=quant_type_enum,
             )
         model = onnx.load(temp_path)
 

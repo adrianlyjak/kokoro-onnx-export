@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "en-core-web-sm",
     "huggingface-hub>=0.28.1",
     "kokoro",
     "misaki[en,ja,zh]>=0.7.6",
@@ -30,9 +31,12 @@ build-backend = "hatchling.build"
 
 [tool.uv.sources]
 kokoro = { path = "../kokoro" }
+en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
 
 [dependency-groups]
 dev = [
+    "ipykernel>=6.29.5",
+    "pandas>=2.2.3",
     "pytest>=8.3.4",
     "ruff>=0.9.6",
 ]

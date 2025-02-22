@@ -433,7 +433,10 @@ class NodeQuantSpec:
 
 
 def select_node_datatypes(
-    quant_threshold: float, fp16_threshold: float, trial_csv_path: str
+    quant_threshold: float,
+    fp16_threshold: float,
+    trial_csv_path: str,
+    quantizable_ops: Optional[list[str]] = None,
 ) -> List[NodeQuantSpec]:
     # Create mapping of rules by op type for easy lookup
     rules_by_op = {rule.op: rule for rule in QUANT_RULES}
@@ -472,7 +475,11 @@ def select_node_datatypes(
         activations_type = DataType.FLOAT32
 
         # Check quantization results if available
-        if "quant" in trials and trials["quant"] < quant_threshold:
+        if (
+            "quant" in trials
+            and trials["quant"] < quant_threshold
+            and (quantizable_ops is None or op_type in quantizable_ops)
+        ):
             # Respect minimum levels from rules
             if rule.min_weights == "int8":
                 weights_type = DataType.INT8
