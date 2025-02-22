@@ -1,3 +1,4 @@
+from numbers import Number
 from pathlib import Path
 
 import onnx
@@ -13,6 +14,18 @@ from .cli import app
 from .cli_verify import verify
 
 
+class KModelForONNXWithDuration(torch.nn.Module):
+    def __init__(self, kmodel: KModel):
+        super().__init__()
+        self.kmodel = kmodel
+
+    def forward(
+        self, input_ids: torch.LongTensor, ref_s: torch.FloatTensor, speed: Number = 1
+    ) -> tuple[torch.FloatTensor, torch.LongTensor]:
+        waveform, duration = self.kmodel.forward_with_tokens(input_ids, ref_s, speed)
+        return waveform, duration
+
+
 @app.command()
 def export(
     output_path: str = typer.Option("kokoro.onnx", help="Path to save the ONNX model"),
@@ -25,6 +38,9 @@ def export(
     score_difference: bool = typer.Option(
         True,
         help="Score the difference between the Torch and ONNX model for a test input after exporting",
+    ),
+    export_duration: bool = typer.Option(
+        True, help="Export the duration output of the model"
     ),
 ) -> None:
     """
@@ -41,7 +57,10 @@ def export(
     opset_version: int = 20
 
     # Initialize model
-    model = KModelForONNX(KModel(disable_complex=True)).eval()
+    if export_duration:
+        model = KModelForONNXWithDuration(KModel(disable_complex=True)).eval()
+    else:
+        model = KModelForONNX(KModel(disable_complex=True)).eval()
 
     # Create dummy inputs
     input_ids = torch.zeros((batch_size, dummy_seq_length), dtype=torch.long)
@@ -76,7 +95,7 @@ def export(
         (input_ids, style, torch.tensor([dummy_speed], dtype=torch.float32)),
         output_path,
         input_names=["input_ids", "style", "speed"],
-        output_names=["waveform"],
+        output_names=["waveform", "duration"] if export_duration else ["waveform"],
         dynamic_axes=dynamic_axes,
         opset_version=opset_version,
         export_params=True,
