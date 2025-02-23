@@ -95,6 +95,9 @@ def verify(
         # Get audio outputs
         torch_audio = torch_output.cpu().numpy()
         onnx_audio = ort_outputs[0]
+        # Unwrap extra dimensions if needed
+        if onnx_audio.ndim == 2:
+            onnx_audio = onnx_audio[0]
 
         # Calculate MSE for audio outputs
         audio_mse = mel_spectrogram_distance(
