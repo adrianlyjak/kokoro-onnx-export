@@ -2,8 +2,6 @@ This folder contains scripts for exporting the KModel to ONNX format.
 
 It uses uv for dependency management. To get started, install uv, and then `uv sync`.
 
-Currently, it's expected that the latest version of kokoro is installed in a sibling directory.
-
 The project exports a CLI. For options, run `uv run kokoro-onnx --help`.
 
 ```bash

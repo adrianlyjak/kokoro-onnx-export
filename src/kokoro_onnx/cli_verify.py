@@ -27,6 +27,9 @@ def verify(
         None, help="Directory to save audio files. If None, uses current directory"
     ),
     profile: bool = typer.Option(False, help="Whether to profile the ONNX model"),
+    gpu: bool = typer.Option(
+        True, help="Whether to use GPU (if available) for inference"
+    ),
 ) -> float:
     """
     Verify ONNX model output against PyTorch model output.
@@ -69,7 +72,9 @@ def verify(
         ref_s = ref_s[input_ids.shape[1] - 1]  # Select the appropriate style vector
 
         # Run the PyTorch model
-        torch_output = torch_model(input_ids=input_ids, ref_s=ref_s, speed=1.0)
+        torch_output, duration = torch_model(
+            input_ids=input_ids, ref_s=ref_s, speed=1.0
+        )
 
         # Run the ONNX model
         ort_inputs = {
@@ -83,7 +88,7 @@ def verify(
         session = ort.InferenceSession(
             onnx_path,
             session_options,
-            providers=execution_providers,
+            providers=execution_providers if gpu else ["CPUExecutionProvider"],
         )
         ort_outputs = session.run(None, ort_inputs)
 

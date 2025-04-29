@@ -125,4 +125,5 @@ def export(
             voice="af_heart",
             output_dir=None,
             profile=False,
+            gpu=True,
         )
